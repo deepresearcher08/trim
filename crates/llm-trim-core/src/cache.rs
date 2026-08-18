@@ -59,7 +59,9 @@ impl CacheStore {
                 fs::create_dir_all(parent)?;
             }
         }
-        fs::write(path, json).context("writing cache file")?;
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, json).context("writing temp cache file")?;
+        fs::rename(&tmp_path, path).context("renaming temp cache file to target")?;
         Ok(())
     }
 }
@@ -299,6 +301,54 @@ mod tests {
         // 5. Test disabled cache
         let units_disabled = parse_codebase_cached(&temp_dir, Some(&cache_file), false)?;
         assert_eq!(units_disabled.len(), 1);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_corruption_tolerance() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join("llm_trim_test_corruption");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir)?;
+
+        let file = temp_dir.join("lib.rs");
+        fs::write(&file, "pub fn check() {}")?;
+
+        let cache_file = temp_dir.join(".trim_cache");
+        fs::write(&cache_file, "{ invalid json garbage }")?;
+
+        // Loading should fall back to default cache cleanly and not panic
+        let units = parse_codebase_cached(&temp_dir, Some(&cache_file), true)?;
+        assert_eq!(units.len(), 1);
+        assert!(cache_file.exists());
+
+        let loaded = CacheStore::load(&cache_file)?;
+        assert_eq!(loaded.entries.len(), 1);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_and_large_files() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join("llm_trim_test_limits");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir)?;
+
+        // Empty file
+        fs::write(temp_dir.join("empty.rs"), "")?;
+
+        // Large file with 1000 identical functions to test size/memory limits
+        let mut large_content = String::new();
+        for idx in 0..1000 {
+            large_content.push_str(&format!("pub fn func_{}() {{ let a = {}; }}\n", idx, idx));
+        }
+        fs::write(temp_dir.join("large.rs"), large_content)?;
+
+        let cache_file = temp_dir.join(".trim_cache");
+        let units = parse_codebase_cached(&temp_dir, Some(&cache_file), true)?;
+        assert_eq!(units.len(), 1000);
 
         let _ = fs::remove_dir_all(&temp_dir);
         Ok(())
