@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/llm-trim-core",
+    "crates/llm-trim-rank",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Deep <deepresearcher08>"]
+
+[package]
+name = "llm-trim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Zero-config semantic context minimizer: reduce a codebase to a high-density LLM prompt payload"
+
+[[bin]]
+name = "trim"
+path = "src/main.rs"
+
+[dependencies]
+llm-trim-core = { path = "crates/llm-trim-core" }
+llm-trim-rank = { path = "crates/llm-trim-rank" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+
+[features]
+default = []
+onnx = ["llm-trim-rank/onnx"]
+
+[profile.release]
+lto = true
+opt-level = 3

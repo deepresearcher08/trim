@@ -1,0 +1,17 @@
+[package]
+name = "llm-trim-rank"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tier 2 (intent-based semantic ranking) for llm-trim: heuristic BM25-lite ranker by default, optional ONNX cross-encoder via the 'onnx' feature"
+
+[dependencies]
+anyhow = "1"
+llm-trim-core = { path = "../llm-trim-core" }
+
+ort = { version = "2.0.0-rc.4", optional = true }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+
+[features]
+default = []
+onnx = ["dep:ort", "dep:tokenizers"]

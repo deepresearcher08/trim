@@ -1,0 +1,14 @@
+# Rust cargo output
+/target
+Cargo.lock
+
+# IDE / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local model weights / test outputs
+*.onnx
+tokenizer.json
+output.txt
