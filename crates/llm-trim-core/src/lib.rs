@@ -3,16 +3,21 @@
 //! Tier 1: Tree-Sitter based structural parsing + skeletonization.
 //! Tier 3: budget-driven selection engine.
 //!
+//! Incremental caching (.trim_cache) avoids redundant AST re-parsing
+//! across invocations by tracking file metadata and content hashes.
+//!
 //! Tier 2 (semantic ranking) lives in the sibling `llm-trim-rank` crate so
 //! that ONNX Runtime stays an optional, swappable dependency — the core
 //! parsing/skeletonization pipeline works with zero ML dependencies.
 
 pub mod budget;
+pub mod cache;
 pub mod lang;
 pub mod skeleton;
 pub mod unit;
 
 pub use budget::{render_payload, select_within_budget, BudgetPlan};
+pub use cache::parse_codebase_cached;
 pub use lang::Language;
 pub use skeleton::extract_units;
 pub use unit::{CodeUnit, UnitKind};

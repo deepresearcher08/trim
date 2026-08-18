@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use llm_trim_core::{parse_codebase, render_payload, select_within_budget};
+use llm_trim_core::{parse_codebase_cached, render_payload, select_within_budget};
 use llm_trim_rank::{HeuristicRanker, Ranker};
 use std::path::PathBuf;
 
@@ -50,13 +50,27 @@ struct Cli {
     /// Max sequence length for the cross-encoder (only used with --ranker onnx).
     #[arg(long, default_value_t = 256)]
     max_length: usize,
+
+    /// Disable incremental caching. Every invocation will re-parse the
+    /// entire repository from scratch without reading or writing a
+    /// .trim_cache file.
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Path to the cache file. Defaults to `.trim_cache` inside the
+    /// scanned root directory.
+    #[arg(long)]
+    cache_file: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let units = parse_codebase(&cli.path)?;
+    let cache_enabled = !cli.no_cache;
+    let cache_path = cli.cache_file.as_deref();
+    let units = parse_codebase_cached(&cli.path, cache_path, cache_enabled)?;
+
     if units.is_empty() {
         eprintln!("trim: no supported source files found under {}", cli.path.display());
         return Ok(());
@@ -126,4 +140,4 @@ fn build_scores(
         }
         other => anyhow::bail!("unknown --ranker '{other}', expected 'heuristic' or 'onnx'"),
     }
-}
+}

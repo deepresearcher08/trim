@@ -12,3 +12,6 @@ Thumbs.db
 *.onnx
 tokenizer.json
 output.txt
+
+# Incremental parse cache
+.trim_cache

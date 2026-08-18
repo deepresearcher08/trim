@@ -8,6 +8,8 @@ description = "Tier 1 (Tree-Sitter parsing + skeletonization) and Tier 3 (budget
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 ignore = "0.4"
 log = "0.4"
 

@@ -8,7 +8,7 @@ By combining Abstract Syntax Tree (AST) structural parsing, intent-driven semant
 
 ## Architectural & Context Preparation Model
 
-The design of `trim` centers around four formal principles:
+The design of `trim` centers around five formal principles:
 
 ### 1. AST-Guided Structural Extraction
 Instead of relying on line-based or arbitrary token-window slicing, `trim` uses Tree-Sitter grammars to parse source files into Abstract Syntax Trees. It isolates top-level declarations (functions, structs, classes, interfaces, traits, methods, and constants), ensuring that code units correspond strictly to complete syntactic constructs.
@@ -23,6 +23,9 @@ When provided with an intent query (via `--intent`), `trim` evaluates candidate 
 `trim` allocates a target token budget (`--budget`) using a two-pass selection process:
 - **Pass 1 (Breadth First):** Admits structural skeletons for all relevant symbols across the target directory up to the budget limit, maximizing broad architectural visibility.
 - **Pass 2 (Depth First):** Iterates through units in descending order of relevance score, upgrading skeletonized signatures to full implementations whenever remaining token budget permits.
+
+### 5. Incremental AST Caching
+On large repositories, re-parsing every source file on each invocation introduces avoidable overhead. `trim` maintains a `.trim_cache` file that records file metadata (modification time, size) and a SHA-256 content hash for each previously parsed source file. On subsequent runs, files whose metadata matches the cached state are skipped entirely, and their extracted code units are reused directly. Files with changed metadata but identical content (e.g., after a `touch` or branch switch without edits) fall through to a secondary content-hash check. Only genuinely modified or newly created files trigger a full Tree-Sitter parse. Entries for deleted files are purged automatically.
 
 ---
 
@@ -62,6 +65,12 @@ trim /path/to/repository --intent "budget allocation algorithm" --budget 4000 --
 trim . --intent "tree sitter parsing" --budget 6000 --out context_payload.txt
 ```
 
+### Disabling or Relocating the Parse Cache
+```bash
+trim . --no-cache
+trim . --cache-file /tmp/my_cache
+```
+
 ---
 
 ## Command-Line Options
@@ -81,6 +90,8 @@ Options:
       --model <PATH>           Path to model.onnx (required when using --ranker onnx)
       --tokenizer <PATH>       Path to tokenizer.json (required when using --ranker onnx)
       --max-length <LENGTH>    Maximum sequence length for cross-encoder processing [default: 256]
+      --no-cache               Disable incremental caching; re-parse every file from scratch
+      --cache-file <PATH>      Path to the cache file [default: .trim_cache in scanned root]
   -h, --help                   Print help information
   -V, --version                Print version information
 ```
