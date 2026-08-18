@@ -49,27 +49,36 @@ pub fn discover_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// End-to-end Tier 1 pass: discover files, parse each with Tree-Sitter, and
-/// extract CodeUnits (skeletonized + full text) for every top-level
-/// definition found.
+use rayon::prelude::*;
+
+/// End-to-end Tier 1 pass: discover files, parse each with Tree-Sitter in parallel,
+/// and extract CodeUnits (skeletonized + full text) for every top-level definition found.
 pub fn parse_codebase(root: &Path) -> Result<Vec<CodeUnit>> {
     let files = discover_source_files(root)?;
-    let mut all_units = Vec::new();
-    let mut next_id = 0usize;
 
-    for file in files {
-        let lang = match Language::from_path(&file) {
-            Some(l) => l,
-            None => continue,
-        };
-        let source = match std::fs::read_to_string(&file) {
-            Ok(s) => s,
-            Err(_) => continue, // skip binary / non-UTF8 files silently
-        };
-        match extract_units(&file, lang, &source, &mut next_id) {
-            Ok(mut units) => all_units.append(&mut units),
-            Err(e) => log::warn!("failed to parse {}: {e}", file.display()),
-        }
+    let mut all_units: Vec<CodeUnit> = files
+        .into_par_iter()
+        .filter_map(|file| {
+            let lang = Language::from_path(&file)?;
+            let source = std::fs::read_to_string(&file).ok()?;
+            let mut dummy_id = 0usize;
+            match extract_units(&file, lang, &source, &mut dummy_id) {
+                Ok(units) => Some(units),
+                Err(e) => {
+                    log::warn!("failed to parse {}: {e}", file.display());
+                    None
+                }
+            }
+        })
+        .flatten()
+        .collect();
+
+    // Sort files to preserve deterministic unit ordering across parallel workers
+    all_units.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.start_line.cmp(&b.start_line)));
+
+    // Reassign contiguous global unit IDs
+    for (idx, unit) in all_units.iter_mut().enumerate() {
+        unit.id = idx;
     }
 
     Ok(all_units)

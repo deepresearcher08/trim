@@ -88,8 +88,14 @@ fn main() -> Result<()> {
             .filter(|p| matches!(p.inclusion, llm_trim_core::budget::Inclusion::Full))
             .count();
         let skeleton_count = plan.included.len() - full_count;
+        let total_raw_tokens: usize = units.iter().map(|u| u.est_tokens_full).sum();
+        let reduction = if total_raw_tokens > 0 {
+            (100.0 * (1.0 - (plan.used_tokens as f64 / total_raw_tokens as f64))).max(0.0)
+        } else {
+            0.0
+        };
         eprintln!(
-            "trim: {} units found, {} included ({} full, {} skeleton), {} excluded, {}/{} tokens used",
+            "trim: {} units found, {} included ({} full, {} skeleton), {} excluded, {}/{} tokens used ({:.1}% compression from {} raw tokens)",
             units.len(),
             plan.included.len(),
             full_count,
@@ -97,6 +103,8 @@ fn main() -> Result<()> {
             plan.excluded_unit_ids.len(),
             plan.used_tokens,
             plan.budget_tokens,
+            reduction,
+            total_raw_tokens,
         );
     }
 
