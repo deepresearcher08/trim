@@ -4,6 +4,7 @@ members = [
     ".",
     "crates/llm-trim-core",
     "crates/llm-trim-rank",
+    "crates/llm-trim-mcp",
 ]
 
 [workspace.package]

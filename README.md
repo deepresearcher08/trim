@@ -131,6 +131,38 @@ pub fn select_within_budget(
 | **TSX** | `.tsx` | `tree-sitter-typescript` |
 | **Go** | `.go` | `tree-sitter-go` |
 
+## Model Context Protocol (MCP) Server
+
+`trim` includes an MCP server implementation (`trim-mcp`) that exposes codebase minimization tools directly to LLM coding assistants such as Claude Code, Cursor, and Cline over standard I/O.
+
+### Installation
+
+```bash
+cargo install --path crates/llm-trim-mcp
+```
+
+### Client Configuration
+
+Add `trim-mcp` to your client configuration file (e.g., `claude_desktop_config.json` or `.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "trim": {
+      "command": "trim-mcp"
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `trim` | Scans a repository directory, ranks code units by intent relevance, and returns a budget-optimized prompt payload. | `path` (string, required), `intent` (string, optional), `budget` (number, optional, default: 8000), `no_cache` (boolean, optional) |
+| `trim_file` | Parses a single source file and returns its structural definitions, signatures, line numbers, and token estimates. | `path` (string, required) |
+| `list_languages` | Returns the list of supported programming languages and file extensions. | None |
+
 ---
 
 ## License

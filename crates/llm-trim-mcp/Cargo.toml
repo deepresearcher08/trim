@@ -1,0 +1,20 @@
+[package]
+name = "llm-trim-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP (Model Context Protocol) server for trim, enabling LLM agents to invoke codebase context minimization as a tool"
+
+[[bin]]
+name = "trim-mcp"
+path = "src/main.rs"
+
+[dependencies]
+llm-trim-core = { path = "../llm-trim-core" }
+llm-trim-rank = { path = "../llm-trim-rank" }
+rmcp = { version = "3", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+env_logger = "0.11"
