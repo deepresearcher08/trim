@@ -250,7 +250,7 @@ impl TrimServer {
 
 #[tool_handler(
     name = "trim-mcp",
-    version = "0.1.0",
+    version = "0.1.1",
     instructions = "MCP server for trim, a zero-config semantic context minimizer for LLM prompts. Exposes three tools: 'trim' to generate optimized codebase context payloads across 3 inclusion tiers, 'trim_file' to inspect structural units in a single file, and 'list_languages' to show supported languages."
 )]
 impl ServerHandler for TrimServer {}

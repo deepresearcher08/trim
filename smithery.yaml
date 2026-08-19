@@ -1,0 +1,18 @@
+# Smithery configuration for trim-mcp
+# https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties: {}
+  commandFunction: |-
+    (config) => ({
+      command: 'trim-mcp',
+      args: [],
+      env: {}
+    })
+
+build:
+  dockerfile: Dockerfile
+  dockerBuildPath: .

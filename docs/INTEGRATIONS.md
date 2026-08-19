@@ -85,7 +85,10 @@ def get_codebase_context(intent: str, budget: int = 8000, path: str = ".") -> st
 
 ## 4. MCP Clients (Claude Code, Cursor, Windsurf, Cline)
 
-Configure `trim-mcp` in your IDE/assistant MCP configuration:
+### Quick Install via Smithery
+```bash
+npx -y @smithery/cli install @deepresearcher08/trim --client claude
+```
 
 ### Cursor (`.cursor/mcp.json`) & Claude Desktop (`claude_desktop_config.json`)
 ```json
@@ -102,3 +105,4 @@ Configure `trim-mcp` in your IDE/assistant MCP configuration:
 ```bash
 claude mcp add trim trim-mcp
 ```
+

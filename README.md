@@ -135,8 +135,15 @@ Detailed test methodology and per-language metrics are documented in [BENCHMARKS
 `trim` ships with `trim-mcp` to hook directly into Claude Code, Cursor, and Cline.
 
 ### Install
+
+Via Smithery (automatic setup for Claude Desktop, Cursor, or Cline):
 ```bash
-cargo install --path crates/llm-trim-mcp
+npx -y @smithery/cli install @deepresearcher08/trim --client claude
+```
+
+Or via Cargo:
+```bash
+cargo install llm-trim-mcp
 ```
 
 ### Config (`claude_desktop_config.json` or `.cursor/mcp.json`)
