@@ -13,8 +13,8 @@ name = "trim-mcp"
 path = "src/main.rs"
 
 [dependencies]
-llm-trim-core = { path = "../llm-trim-core" }
-llm-trim-rank = { path = "../llm-trim-rank" }
+llm-trim-core = { path = "../llm-trim-core", version = "0.1.0" }
+llm-trim-rank = { path = "../llm-trim-rank", version = "0.1.0" }
 rmcp = { version = "3", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
