@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "MCP (Model Context Protocol) server for trim, enabling LLM agents to invoke codebase context minimization as a tool"
+repository = "https://github.com/deepresearcher08/trim"
+homepage = "https://github.com/deepresearcher08/trim"
+documentation = "https://github.com/deepresearcher08/trim#readme"
 
 [[bin]]
 name = "trim-mcp"

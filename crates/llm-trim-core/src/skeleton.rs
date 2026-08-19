@@ -1,6 +1,6 @@
 use crate::lang::Language;
 use crate::unit::{estimate_tokens, CodeUnit, UnitKind};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
 use tree_sitter::{Node, Parser, TreeCursor};
@@ -525,17 +525,110 @@ pub fn extract_units(
     next_id: &mut usize,
 ) -> Result<Vec<CodeUnit>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(lang.ts_language())
-        .map_err(|e| anyhow!("grammar load failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow!("tree-sitter failed to parse {}", file.display()))?;
+    if let Err(e) = parser.set_language(lang.ts_language()) {
+        log::warn!("grammar load failed for {}: {e}, falling back to structural chunker", file.display());
+        return Ok(fallback_extract_units(file, lang, source, next_id));
+    }
+
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => {
+            log::warn!("tree-sitter parse failed for {}, falling back to structural chunker", file.display());
+            return Ok(fallback_extract_units(file, lang, source, next_id));
+        }
+    };
 
     let mut units = Vec::new();
     let mut cursor = tree.walk();
     walk(&mut cursor, lang, source, file, &mut units, next_id);
+
+    if units.is_empty() && !source.trim().is_empty() {
+        // Non-empty file with no top-level recognized AST nodes -> graceful fallback chunking
+        return Ok(fallback_extract_units(file, lang, source, next_id));
+    }
+
     Ok(units)
+}
+
+/// Fallback structural extractor for unparseable or heavily macro-dense source files.
+/// Guarantees 0% dropped files by preserving line boundaries and chunking cleanly.
+pub fn fallback_extract_units(
+    file: &Path,
+    lang: Language,
+    source: &str,
+    next_id: &mut usize,
+) -> Vec<CodeUnit> {
+    let file_stem = file
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "chunk".to_string());
+
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut units = Vec::new();
+    let chunk_size = 50; // split into chunks of at most 50 lines
+
+    for (chunk_idx, chunk_lines) in lines.chunks(chunk_size).enumerate() {
+        let start_line = chunk_idx * chunk_size + 1;
+        let end_line = start_line + chunk_lines.len() - 1;
+        let full_text = chunk_lines.join("\n");
+        let sig = chunk_lines.first().unwrap_or(&"").trim().to_string();
+
+        let (skeleton_text, compact_text) = match lang {
+            Language::Python | Language::Ruby => (
+                format!("{sig}\n    ...  # body elided by trim (fallback chunk)"),
+                if chunk_lines.len() > 10 {
+                    format!("{}\n{}\n    ...  # remaining body elided by trim (fallback chunk)", sig, chunk_lines[1..6].join("\n"))
+                } else {
+                    full_text.clone()
+                },
+            ),
+            Language::Go => (
+                format!("{sig} {{\n    // ... body elided by trim (fallback chunk) ...\n}}"),
+                if chunk_lines.len() > 10 {
+                    format!("{sig} {{\n{}\n    // ... remaining body elided by trim (fallback chunk) ...\n}}", chunk_lines[1..6].join("\n"))
+                } else {
+                    full_text.clone()
+                },
+            ),
+            _ => (
+                format!("{sig} {{\n    /* ... body elided by trim (fallback chunk) ... */\n}}"),
+                if chunk_lines.len() > 10 {
+                    format!("{sig} {{\n{}\n    /* ... remaining body elided by trim (fallback chunk) ... */\n}}", chunk_lines[1..6].join("\n"))
+                } else {
+                    full_text.clone()
+                },
+            ),
+        };
+
+        let est_full = estimate_tokens(&full_text);
+        let est_compact = estimate_tokens(&compact_text);
+        let est_skeleton = estimate_tokens(&skeleton_text);
+
+        units.push(CodeUnit {
+            id: *next_id,
+            file: file.to_path_buf(),
+            kind: UnitKind::Function,
+            name: format!("{file_stem}_part_{}", chunk_idx + 1),
+            doc_comment: None,
+            signature: sig,
+            est_tokens_full: est_full,
+            est_tokens_compact: est_compact,
+            est_tokens_skeleton: est_skeleton,
+            full_text,
+            compact_text,
+            skeleton_text,
+            start_line,
+            end_line,
+            references: vec![],
+        });
+        *next_id += 1;
+    }
+
+    units
 }
 
 fn walk(
@@ -654,5 +747,15 @@ mod tests {
         let php_src = "<?php\nclass UserController {\n    public function getUser($id) {\n        return $id;\n    }\n}\n";
         let php_units = extract_units(&PathBuf::from("user.php"), Language::Php, php_src, &mut id).unwrap();
         assert!(php_units.iter().any(|u| u.name == "UserController"));
+    }
+
+    #[test]
+    fn test_fallback_chunking_on_unparseable_or_freeform_code() {
+        let mut id = 0;
+        // Non-standard freeform statements without top-level AST function/class nodes
+        let raw_src = "const A = 1;\nconst B = 2;\nconsole.log(A + B);\nvar x = 100;\n";
+        let units = extract_units(&PathBuf::from("script.js"), Language::JavaScript, raw_src, &mut id).unwrap();
+        assert!(!units.is_empty(), "fallback must produce units and never drop source files");
+        assert_eq!(units[0].signature, "const A = 1;");
     }
 }

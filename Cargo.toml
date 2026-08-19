@@ -20,15 +20,22 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Zero-config semantic context minimizer: reduce a codebase to a high-density LLM prompt payload"
+repository = "https://github.com/deepresearcher08/trim"
+homepage = "https://github.com/deepresearcher08/trim"
+documentation = "https://github.com/deepresearcher08/trim#readme"
+readme = "README.md"
+keywords = ["llm", "context", "prompt", "ast", "tree-sitter"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "trim"
 path = "src/main.rs"
 
 [dependencies]
-llm-trim-core = { path = "crates/llm-trim-core" }
-llm-trim-rank = { path = "crates/llm-trim-rank" }
+llm-trim-core = { path = "crates/llm-trim-core", version = "0.1.0" }
+llm-trim-rank = { path = "crates/llm-trim-rank", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
+inquire = "0.7"
 anyhow = "1"
 env_logger = "0.11"
 log = "0.4"

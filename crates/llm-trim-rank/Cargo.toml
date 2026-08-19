@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Tier 2 (intent-based semantic ranking) for llm-trim: heuristic BM25-lite ranker by default, optional ONNX cross-encoder via the 'onnx' feature"
+repository = "https://github.com/deepresearcher08/trim"
+homepage = "https://github.com/deepresearcher08/trim"
+documentation = "https://github.com/deepresearcher08/trim#readme"
 
 [dependencies]
 anyhow = "1"

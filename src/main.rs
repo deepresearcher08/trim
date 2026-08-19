@@ -29,6 +29,10 @@ struct Cli {
     #[arg(short, long, default_value_t = 8000)]
     budget: usize,
 
+    /// Interactive TUI wizard mode: step-by-step interactive directory, intent, budget, and feature selection.
+    #[arg(short = 'I', long)]
+    interactive: bool,
+
     /// Write payload to a file instead of stdout.
     #[arg(short, long)]
     out: Option<PathBuf>,
@@ -83,9 +87,82 @@ struct Cli {
     cache_file: Option<PathBuf>,
 }
 
+fn run_interactive_wizard(mut cli: Cli) -> Result<Cli> {
+    eprintln!("\n=== trim Interactive Context Minimizer Wizard ===");
+    eprintln!("Interactive step-by-step setup. Press Enter to accept defaults.\n");
+
+    let path_str = inquire::Text::new("Target repository directory to scan:")
+        .with_default(cli.path.to_str().unwrap_or("."))
+        .prompt()?;
+    cli.path = PathBuf::from(path_str);
+
+    let intent = inquire::Text::new("Task intent or query (e.g. 'auth verification', or blank for overview):")
+        .with_default(&cli.intent)
+        .prompt()?;
+    cli.intent = intent;
+
+    let budget_options = vec![
+        "2000  (Compact - fast context, small edits)",
+        "4000  (Medium - standard function analysis)",
+        "8000  (Default - broad architectural coverage)",
+        "16000 (Large - multi-module refactoring)",
+        "32000 (Extra Large - monorepo whole-project context)",
+        "Custom...",
+    ];
+
+    let budget_selection = inquire::Select::new("Target Token Budget:", budget_options).prompt()?;
+    if budget_selection.starts_with("2000") {
+        cli.budget = 2000;
+    } else if budget_selection.starts_with("4000") {
+        cli.budget = 4000;
+    } else if budget_selection.starts_with("8000") {
+        cli.budget = 8000;
+    } else if budget_selection.starts_with("16000") {
+        cli.budget = 16000;
+    } else if budget_selection.starts_with("32000") {
+        cli.budget = 32000;
+    } else {
+        let custom = inquire::CustomType::<usize>::new("Enter custom token budget:").prompt()?;
+        cli.budget = custom;
+    }
+
+    let feature_options = vec![
+        "Pull Dependencies (--deps)",
+        "Scan & Redact Secrets (--scan-secrets)",
+        "Summary Statistics (--stats)",
+        "Explain Mode Diagnostics (--why)",
+    ];
+
+    let selected_features = inquire::MultiSelect::new("Enable Features:", feature_options)
+        .with_default(&[2]) // summary stats enabled by default in wizard
+        .prompt()?;
+
+    for feat in selected_features {
+        if feat.contains("--deps") {
+            cli.deps = true;
+        }
+        if feat.contains("--scan-secrets") {
+            cli.scan_secrets = true;
+        }
+        if feat.contains("--stats") {
+            cli.stats = true;
+        }
+        if feat.contains("--why") {
+            cli.why = true;
+        }
+    }
+
+    eprintln!("\nStarting trim minimization pipeline...\n");
+    Ok(cli)
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let mut cli = Cli::parse();
+
+    if cli.interactive {
+        cli = run_interactive_wizard(cli)?;
+    }
 
     // Discover and merge persistent configuration
     let config_opt = match &cli.config {
@@ -218,16 +295,13 @@ fn main() -> Result<()> {
 
     let mut payload = render_payload(&units, &plan);
 
-    // Optional secret / credential scanning & redaction
+    // Optional secret scanning & redaction
     if cli.scan_secrets {
-        let (sanitized, detections) = scan_and_redact(&payload);
+        let (redacted, detections) = scan_and_redact(&payload);
+        payload = redacted;
         if !detections.is_empty() {
-            eprintln!(
-                "trim [SECURITY]: Redacted {} sensitive credential/secret occurrence(s) in payload.",
-                detections.len()
-            );
+            eprintln!("trim: redacted {} detected credential(s)/secret(s) from payload", detections.len());
         }
-        payload = sanitized;
     }
 
     if cli.stats {
@@ -241,16 +315,20 @@ fn main() -> Result<()> {
             .iter()
             .filter(|p| matches!(p.inclusion, Inclusion::Compact))
             .count();
-        let skeleton_count = plan.included.len() - full_count - compact_count;
+        let skel_count = plan.included.len() - full_count - compact_count;
 
         let total_raw_tokens: usize = units.iter().map(|u| u.est_tokens_full).sum();
-        let reduction = if total_raw_tokens > 0 {
-            (100.0 * (1.0 - (plan.used_tokens as f64 / total_raw_tokens as f64))).max(0.0)
+        let compression_pct = if total_raw_tokens > 0 {
+            (1.0 - (plan.used_tokens as f64 / total_raw_tokens as f64)) * 100.0
         } else {
             0.0
         };
 
-        let budget_exhausted_count = plan.budget_exhausted_units.len();
+        let budget_exhausted_count = plan
+            .included
+            .iter()
+            .filter(|p| matches!(p.skeleton_reason, Some(SkeletonReason::BudgetExhausted)))
+            .count();
         let low_relevance_count = plan
             .included
             .iter()
@@ -263,18 +341,21 @@ fn main() -> Result<()> {
             plan.included.len(),
             full_count,
             compact_count,
-            skeleton_count,
+            skel_count,
             plan.excluded_unit_ids.len(),
             plan.used_tokens,
             plan.budget_tokens,
-            reduction,
-            total_raw_tokens,
+            compression_pct,
+            total_raw_tokens
         );
-        eprintln!(
-            "      Budget boundary: {} degraded to skeleton due to budget exhaustion, {} due to low relevance.",
-            budget_exhausted_count,
-            low_relevance_count
-        );
+
+        if budget_exhausted_count > 0 || low_relevance_count > 0 {
+            eprintln!(
+                "      Budget boundary: {} degraded to skeleton due to budget exhaustion, {} due to low relevance.",
+                budget_exhausted_count,
+                low_relevance_count
+            );
+        }
     }
 
     match cli.out {

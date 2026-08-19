@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Tier 1 (Tree-Sitter parsing + skeletonization) and Tier 3 (budget engine) for llm-trim"
+repository = "https://github.com/deepresearcher08/trim"
+homepage = "https://github.com/deepresearcher08/trim"
+documentation = "https://github.com/deepresearcher08/trim#readme"
 
 [dependencies]
 anyhow = "1"
