@@ -11,6 +11,12 @@ pub enum Language {
     TypeScript,
     Tsx,
     Go,
+    C,
+    Cpp,
+    Java,
+    CSharp,
+    Ruby,
+    Php,
 }
 
 impl Language {
@@ -23,6 +29,12 @@ impl Language {
             "ts" | "mts" | "cts" => Language::TypeScript,
             "tsx" => Language::Tsx,
             "go" => Language::Go,
+            "c" | "h" => Language::C,
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "c++" | "h++" => Language::Cpp,
+            "java" => Language::Java,
+            "cs" => Language::CSharp,
+            "rb" | "rake" | "gemspec" => Language::Ruby,
+            "php" | "phtml" | "php3" | "php4" | "php5" | "php7" | "phps" => Language::Php,
             _ => return None,
         })
     }
@@ -35,6 +47,12 @@ impl Language {
             Language::TypeScript => tree_sitter_typescript::language_typescript(),
             Language::Tsx => tree_sitter_typescript::language_tsx(),
             Language::Go => tree_sitter_go::language(),
+            Language::C => tree_sitter_c::language(),
+            Language::Cpp => tree_sitter_cpp::language(),
+            Language::Java => tree_sitter_java::language(),
+            Language::CSharp => tree_sitter_c_sharp::language(),
+            Language::Ruby => tree_sitter_ruby::language(),
+            Language::Php => tree_sitter_php::language(),
         }
     }
 
@@ -46,6 +64,12 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::Tsx => "tsx",
             Language::Go => "go",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::Java => "java",
+            Language::CSharp => "csharp",
+            Language::Ruby => "ruby",
+            Language::Php => "php",
         }
     }
 
@@ -53,10 +77,14 @@ impl Language {
     /// pull in an attached doc comment / docstring block.
     pub fn line_comment_prefixes(&self) -> &'static [&'static str] {
         match self {
-            Language::Rust => &["///", "//!", "//"],
+            Language::Rust => &["///", "//!", "//", "/*", "/**"],
             Language::Python => &["#"],
-            Language::JavaScript | Language::TypeScript | Language::Tsx => &["//"],
-            Language::Go => &["//"],
+            Language::JavaScript | Language::TypeScript | Language::Tsx => &["//", "/*", "/**", "*"],
+            Language::Go => &["//", "/*", "/**"],
+            Language::C | Language::Cpp => &["//", "/*", "/**", "*"],
+            Language::Java | Language::CSharp => &["//", "/*", "/**", "*", "///"],
+            Language::Ruby => &["#"],
+            Language::Php => &["//", "/*", "/**", "*", "#"],
         }
     }
 }

@@ -19,6 +19,8 @@ use llm_trim_core::{
     extract_units,
     select_within_budget,
     render_payload,
+    CodeGraph,
+    Inclusion,
     Language,
 };
 use llm_trim_rank::{HeuristicRanker, Ranker};
@@ -41,6 +43,11 @@ struct TrimParams {
     /// when not specified.
     #[schemars(default)]
     budget: Option<usize>,
+
+    /// Automatically pull direct caller/callee dependencies of full units
+    /// so the payload contains connected dependency chains.
+    #[schemars(default)]
+    deps: Option<bool>,
 
     /// When true, skip reading or writing the .trim_cache file and
     /// re-parse every source file from scratch.
@@ -67,7 +74,7 @@ impl TrimServer {
     /// and Go source files.
     #[tool(
         name = "trim",
-        description = "Scan a codebase directory and return a budget-optimized, structurally aware context payload for LLM prompts. Extracts top-level definitions (functions, structs, classes, traits, etc.) via Tree-Sitter AST parsing, ranks them by intent relevance, and assembles the highest-value code units within a token budget. Unincluded definitions are represented as signature-only skeletons with explicit elision markers."
+        description = "Scan a codebase directory and return a budget-optimized, structurally aware context payload for LLM prompts. Extracts top-level definitions (functions, structs, classes, traits, etc.) via Tree-Sitter AST parsing, ranks them by intent relevance and graph centrality, and assembles the highest-value code units across 3 inclusion tiers (Full, Compact, Skeleton) within a token budget."
     )]
     async fn trim(&self, Parameters(params): Parameters<TrimParams>) -> String {
         let root = PathBuf::from(&params.path);
@@ -81,6 +88,7 @@ impl TrimServer {
         let budget = params.budget.unwrap_or(8000);
         let intent = params.intent.as_deref().unwrap_or("");
         let cache_enabled = !params.no_cache.unwrap_or(false);
+        let pull_deps = params.deps.unwrap_or(false);
 
         let units = match parse_codebase_cached(&root, None, cache_enabled) {
             Ok(u) => u,
@@ -91,21 +99,47 @@ impl TrimServer {
             return format!("No supported source files found under '{}'.", params.path);
         }
 
+        let graph = CodeGraph::build(&units);
         let ranker = HeuristicRanker::new();
-        let scores = ranker.score(intent, &units);
-        let plan = select_within_budget(&units, &scores, budget);
+        let lexical_scores = ranker.score(intent, &units);
+        let mut scores = graph.apply_centrality_boost(&lexical_scores, &units, 0.4);
+
+        let mut plan = select_within_budget(&units, &scores, budget);
+
+        if pull_deps {
+            let full_ids: Vec<usize> = plan
+                .included
+                .iter()
+                .filter(|p| matches!(p.inclusion, Inclusion::Full))
+                .map(|p| p.unit_id)
+                .collect();
+            let direct_deps = graph.pull_direct_dependencies(&full_ids);
+            if !direct_deps.is_empty() {
+                for &dep_id in &direct_deps {
+                    if let Some(s) = scores.get_mut(&dep_id) {
+                        *s += 2.5;
+                    }
+                }
+                plan = select_within_budget(&units, &scores, budget);
+            }
+        }
+
         let payload = render_payload(&units, &plan);
 
         let full_count = plan.included.iter()
-            .filter(|p| matches!(p.inclusion, llm_trim_core::budget::Inclusion::Full))
+            .filter(|p| matches!(p.inclusion, Inclusion::Full))
             .count();
-        let skel_count = plan.included.len() - full_count;
+        let compact_count = plan.included.iter()
+            .filter(|p| matches!(p.inclusion, Inclusion::Compact))
+            .count();
+        let skel_count = plan.included.len() - full_count - compact_count;
 
         format!(
-            "# trim summary: {} units found, {} included ({} full, {} skeleton), {} excluded, {}/{} tokens used\n\n{}",
+            "# trim summary: {} units found, {} included ({} full, {} compact, {} skeleton), {} excluded, {}/{} tokens used\n\n{}",
             units.len(),
             plan.included.len(),
             full_count,
+            compact_count,
             skel_count,
             plan.excluded_unit_ids.len(),
             plan.used_tokens,
@@ -133,7 +167,7 @@ impl TrimServer {
         let lang = match Language::from_path(&path) {
             Some(l) => l,
             None => return format!(
-                "Error: unsupported file extension for '{}'. Supported: .rs, .py, .pyi, .js, .jsx, .mjs, .cjs, .ts, .mts, .cts, .tsx, .go",
+                "Error: unsupported file extension for '{}'. Supported: .rs, .py, .pyi, .js, .jsx, .mjs, .cjs, .ts, .mts, .cts, .tsx, .go, .c, .h, .cpp, .cc, .cxx, .hpp, .java, .cs, .rb, .php",
                 params.path
             ),
         };
@@ -160,7 +194,9 @@ impl TrimServer {
             signature: String,
             lines: String,
             tokens_full: usize,
+            tokens_compact: usize,
             tokens_skeleton: usize,
+            references: Vec<String>,
         }
 
         let summaries: Vec<UnitSummary> = units.iter().map(|u| UnitSummary {
@@ -169,7 +205,9 @@ impl TrimServer {
             signature: u.signature.clone(),
             lines: format!("{}-{}", u.start_line, u.end_line),
             tokens_full: u.est_tokens_full,
+            tokens_compact: u.est_tokens_compact,
             tokens_skeleton: u.est_tokens_skeleton,
+            references: u.references.clone(),
         }).collect();
 
         match serde_json::to_string_pretty(&summaries) {
@@ -192,13 +230,19 @@ impl TrimServer {
             ("TypeScript", ".ts, .mts, .cts"),
             ("TSX", ".tsx"),
             ("Go", ".go"),
+            ("C", ".c, .h"),
+            ("C++", ".cpp, .cc, .cxx, .hpp, .hxx, .hh"),
+            ("Java", ".java"),
+            ("C#", ".cs"),
+            ("Ruby", ".rb, .rake, .gemspec"),
+            ("PHP", ".php, .phtml"),
         ];
 
-        let mut out = String::from("Supported languages:\n\n");
-        out.push_str("| Language     | File Extensions            |\n");
-        out.push_str("|-------------|----------------------------|\n");
+        let mut out = String::from("Supported languages (12):\n\n");
+        out.push_str("| Language     | File Extensions                                |\n");
+        out.push_str("|-------------|------------------------------------------------|\n");
         for (lang, exts) in &languages {
-            out.push_str(&format!("| {:<11} | {:<26} |\n", lang, exts));
+            out.push_str(&format!("| {:<11} | {:<46} |\n", lang, exts));
         }
         out
     }
@@ -207,7 +251,7 @@ impl TrimServer {
 #[tool_handler(
     name = "trim-mcp",
     version = "0.1.0",
-    instructions = "MCP server for trim, a zero-config semantic context minimizer for LLM prompts. Exposes three tools: 'trim' to generate optimized codebase context payloads, 'trim_file' to inspect structural units in a single file, and 'list_languages' to show supported languages."
+    instructions = "MCP server for trim, a zero-config semantic context minimizer for LLM prompts. Exposes three tools: 'trim' to generate optimized codebase context payloads across 3 inclusion tiers, 'trim_file' to inspect structural units in a single file, and 'list_languages' to show supported languages."
 )]
 impl ServerHandler for TrimServer {}
 

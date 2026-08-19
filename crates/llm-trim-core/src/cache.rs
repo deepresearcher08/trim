@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 pub const DEFAULT_CACHE_FILENAME: &str = ".trim_cache";
-pub const CURRENT_CACHE_VERSION: u32 = 1;
+pub const CURRENT_CACHE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileCacheEntry {

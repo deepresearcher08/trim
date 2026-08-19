@@ -46,6 +46,9 @@ pub struct CodeUnit {
     pub signature: String,
     /// Full source text of the definition, verbatim.
     pub full_text: String,
+    /// Intermediate graceful degradation tier: signature + doc comment +
+    /// first N body statements/lines + compact elision marker.
+    pub compact_text: String,
     /// Signature + doc comment + an elision marker in place of the body.
     /// Always syntactically inert (never truncated mid-token) so it can be
     /// safely dropped into a prompt without misleading the model into
@@ -56,7 +59,12 @@ pub struct CodeUnit {
     pub end_line: usize,
     /// Cheap token estimate (chars / 4), used by the Tier 3 budget engine.
     pub est_tokens_full: usize,
+    pub est_tokens_compact: usize,
     pub est_tokens_skeleton: usize,
+    /// Identifier / symbol references (calls, types, instantiated structs)
+    /// extracted from the body for cross-file dependency graph analysis.
+    #[serde(default)]
+    pub references: Vec<String>,
 }
 
 pub fn estimate_tokens(s: &str) -> usize {

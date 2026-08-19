@@ -1,24 +1,27 @@
 //! llm-trim-core
 //!
-//! Tier 1: Tree-Sitter based structural parsing + skeletonization.
-//! Tier 3: budget-driven selection engine.
+//! Tier 1: Tree-Sitter based structural parsing + skeletonization (with 3 inclusion tiers).
+//! Tier 2 (graph): In-memory reference graph & PageRank centrality.
+//! Tier 3: budget-driven selection engine with graceful degradation.
 //!
 //! Incremental caching (.trim_cache) avoids redundant AST re-parsing
 //! across invocations by tracking file metadata and content hashes.
-//!
-//! Tier 2 (semantic ranking) lives in the sibling `llm-trim-rank` crate so
-//! that ONNX Runtime stays an optional, swappable dependency — the core
-//! parsing/skeletonization pipeline works with zero ML dependencies.
 
 pub mod budget;
 pub mod cache;
+pub mod config;
+pub mod graph;
 pub mod lang;
+pub mod secrets;
 pub mod skeleton;
 pub mod unit;
 
-pub use budget::{render_payload, select_within_budget, BudgetPlan};
+pub use budget::{render_payload, select_within_budget, BudgetPlan, Inclusion, PlannedUnit, SkeletonReason};
 pub use cache::parse_codebase_cached;
+pub use config::TrimConfig;
+pub use graph::CodeGraph;
 pub use lang::Language;
+pub use secrets::scan_and_redact;
 pub use skeleton::extract_units;
 pub use unit::{CodeUnit, UnitKind};
 
@@ -52,7 +55,7 @@ pub fn discover_source_files(root: &Path) -> Result<Vec<PathBuf>> {
 use rayon::prelude::*;
 
 /// End-to-end Tier 1 pass: discover files, parse each with Tree-Sitter in parallel,
-/// and extract CodeUnits (skeletonized + full text) for every top-level definition found.
+/// and extract CodeUnits (skeletonized + compact + full text) for every top-level definition found.
 pub fn parse_codebase(root: &Path) -> Result<Vec<CodeUnit>> {
     let files = discover_source_files(root)?;
 
