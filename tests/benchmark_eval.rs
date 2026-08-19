@@ -17,7 +17,12 @@ struct TestBenchmarkRepo {
 
 impl TestBenchmarkRepo {
     pub fn setup() -> Self {
-        let dir = std::env::temp_dir().join(format!("llm_trim_benchmark_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "llm_trim_benchmark_{}_{:?}_{}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -226,3 +231,258 @@ fn test_benchmark_graceful_degradation_no_hard_cliff() {
         .any(|p| matches!(p.inclusion, Inclusion::Compact | Inclusion::Full));
     assert!(has_compact_or_full, "Graceful degradation should admit Compact/Full without falling to bare signatures for all units");
 }
+
+#[test]
+fn test_hard_cliff_free_function_budget_sweeps() {
+    // Synthetic large worker function with real code
+    let temp_dir = std::env::temp_dir().join(format!("trim_hardcliff_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let ts_file = temp_dir.join("worker.ts");
+    fs::write(
+        &ts_file,
+        r#"
+export function bigWorker(tasks: string[], maxConcurrency: number): { processed: number, errors: string[] } {
+    let processed = 0;
+    const errors: string[] = [];
+    for (const task of tasks) {
+        try {
+            console.log("Processing task: " + task);
+            processed++;
+        } catch (e: any) {
+            errors.push(e.message);
+        }
+    }
+    return { processed, errors };
+}
+
+export function smallHelper(): number {
+    return 42;
+}
+
+export function anotherSmall(): string {
+    return "ok";
+}
+"#,
+    )
+    .unwrap();
+
+    let units = parse_codebase_cached(&temp_dir, None, false).unwrap();
+    let big_worker = units.iter().find(|u| u.name == "bigWorker").unwrap();
+
+    // Verify token estimates: skeleton must be substantially smaller than full
+    assert!(big_worker.est_tokens_skeleton < big_worker.est_tokens_full,
+        "bigWorker skeleton ({}) must be smaller than full ({})",
+        big_worker.est_tokens_skeleton, big_worker.est_tokens_full);
+
+    let ranker = HeuristicRanker::new();
+    let scores = ranker.score("bigWorker process tasks concurrency", &units);
+
+    // Budget sweeps: 200, 165, 150, 100, 80, 40
+    let budgets = [200, 165, 150, 100, 80, 40];
+    for &budget in &budgets {
+        let plan = select_within_budget(&units, &scores, budget);
+        let big_included = plan.included.iter().find(|p| p.unit_id == big_worker.id);
+        assert!(
+            big_included.is_some(),
+            "bigWorker should be included at budget {budget}, but was dropped! Plan: {:?}",
+            plan
+        );
+        let planned = big_included.unwrap();
+        assert!(plan.used_tokens <= budget);
+        if budget >= big_worker.est_tokens_full {
+            assert_eq!(planned.inclusion, Inclusion::Full);
+        } else if budget >= big_worker.est_tokens_compact {
+            assert!(matches!(planned.inclusion, Inclusion::Compact | Inclusion::Full));
+        } else {
+            assert_eq!(planned.inclusion, Inclusion::Skeleton);
+        }
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_adversarial_dedupe_intent_ranking_and_budget() {
+    let temp_dir = std::env::temp_dir().join(format!("trim_dedupe_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let ts_file = temp_dir.join("service.ts");
+    fs::write(
+        &ts_file,
+        r#"
+export function dedupe_requests(reqs: Array<{ id: string, payload: any }>): Array<{ id: string, payload: any }> {
+    const seen = new Set<string>();
+    const unique = [];
+    for (const req of reqs) {
+        if (!seen.has(req.id)) {
+            seen.add(req.id);
+            unique.push(req);
+        }
+    }
+    return unique;
+}
+
+export function calculateTotal(prices: number[]): number {
+    return prices.reduce((a, b) => a + b, 0);
+}
+
+export function renderTable(rows: string[][]): string {
+    return rows.map(r => r.join("\t")).join("\n");
+}
+
+export function parseQuery(raw: string): Record<string, string> {
+    const params: Record<string, string> = {};
+    for (const pair of raw.split("&")) {
+        const [k, v] = pair.split("=");
+        params[k] = v;
+    }
+    return params;
+}
+"#,
+    )
+    .unwrap();
+
+    let units = parse_codebase_cached(&temp_dir, None, false).unwrap();
+    let ranker = HeuristicRanker::new();
+
+    // Adversarial intent: zero common vocab with function name except concept of running twice / requests
+    let scores = ranker.score("find the code that stops the same request from running twice", &units);
+    let dedupe_unit = units.iter().find(|u| u.name == "dedupe_requests").unwrap();
+    let dedupe_score = scores.get(&dedupe_unit.id).copied().unwrap_or(0.0);
+
+    for u in &units {
+        if u.id != dedupe_unit.id {
+            let other_score = scores.get(&u.id).copied().unwrap_or(0.0);
+            assert!(
+                dedupe_score >= other_score,
+                "dedupe_requests score ({dedupe_score}) should beat {} ({other_score})",
+                u.name
+            );
+        }
+    }
+
+    // At budget 60, dedupe_requests should be included (compact or skeleton) and NOT dropped
+    let plan = select_within_budget(&units, &scores, 60);
+    let is_included = plan.included.iter().any(|p| p.unit_id == dedupe_unit.id);
+    assert!(is_included, "dedupe_requests should be included at budget 60, not dropped");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_class_member_payload_deduplication_multi_language() {
+    let temp_dir = std::env::temp_dir().join(format!("trim_class_dedup_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // 1. TypeScript class with methods
+    fs::write(
+        temp_dir.join("Auth.ts"),
+        r#"
+export class AuthManager {
+    public validate(token: string): boolean {
+        return token.length > 5;
+    }
+    public invalidate(token: string): void {
+        console.log("invalidated: " + token);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // 2. Java class with methods
+    fs::write(
+        temp_dir.join("AuthCheck.java"),
+        r#"
+public class AuthCheck {
+    public boolean check(String token) {
+        return token != null;
+    }
+    public void reset() {
+        // reset
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let units = parse_codebase_cached(&temp_dir, None, false).unwrap();
+    let ranker = HeuristicRanker::new();
+    let scores = ranker.score("AuthManager AuthCheck validate check", &units);
+
+    // Large budget where both classes and methods are selected in Full
+    let plan = select_within_budget(&units, &scores, 4000);
+    let payload = render_payload(&units, &plan);
+
+    // Verify method definitions are NOT duplicated in the output payload
+    let validate_count = payload.matches("public validate(token: string): boolean").count();
+    assert_eq!(validate_count, 1, "validate method should appear exactly once in payload:\n{payload}");
+
+    let check_count = payload.matches("public boolean check(String token)").count();
+    assert_eq!(check_count, 1, "check method should appear exactly once in payload:\n{payload}");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_secrets_scanner_coverage_and_false_positives() {
+    use llm_trim_core::scan_and_redact;
+
+    let test_code = r#"
+const gcp_key = "AIzaSyFake1234567890abcdefghijklmnopqr";
+const aws_access = "AKIAIOSFODNN7EXAMPLE";
+const gh_pat = "ghp_FAKE1234567890abcdefghijklmnopqrstuv";
+const aws_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+let user_password = "P@ssw0rd-NotReal-12345";
+
+// Innocent code that must NOT trigger false positives
+let secret = 'default';
+let token = 0;
+let apiKeyFromName = "innocent_var_name";
+function getToken() { return 123; }
+"#;
+
+    let (redacted, detections) = scan_and_redact(test_code);
+
+    // All 5 real secrets must be caught
+    assert!(!redacted.contains("AIzaSyFake1234567890abcdefghijklmnopqr"));
+    assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(!redacted.contains("ghp_FAKE1234567890abcdefghijklmnopqrstuv"));
+    assert!(!redacted.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
+    assert!(!redacted.contains("P@ssw0rd-NotReal-12345"));
+
+    // Innocent values must remain intact
+    assert!(redacted.contains("secret = 'default'"));
+    assert!(redacted.contains("token = 0"));
+    assert!(redacted.contains("function getToken()"));
+
+    assert!(detections.len() >= 5);
+}
+
+#[test]
+fn test_graph_pagerank_boost_toggle() {
+    let repo = TestBenchmarkRepo::setup();
+    let units = parse_codebase_cached(&repo.dir, None, false).unwrap();
+    let graph = CodeGraph::build(&units);
+    let ranker = HeuristicRanker::new();
+
+    let lexical = ranker.score("pool handle", &units);
+
+    // Graph enabled
+    let scores_with_graph = graph.apply_centrality_boost(&lexical, &units, 1.0);
+    // Graph disabled
+    let scores_no_graph = graph.apply_centrality_boost(&lexical, &units, 0.0);
+
+    assert_eq!(scores_no_graph, lexical, "With weight 0.0, scores must match pure lexical");
+
+    let pool_unit = units.iter().find(|u| u.name == "dispose_idle_handle").unwrap();
+    let with_g = scores_with_graph.get(&pool_unit.id).copied().unwrap_or(0.0);
+    let without_g = scores_no_graph.get(&pool_unit.id).copied().unwrap_or(0.0);
+
+    assert!(with_g >= without_g, "Graph centrality boost should increase or preserve score");
+}
+

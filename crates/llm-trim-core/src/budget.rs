@@ -187,16 +187,32 @@ pub fn select_within_budget(
 }
 
 /// Render a BudgetPlan back into the final prompt payload text, grouped by
-/// file, in original source order within each file.
+/// file, with files ordered by relevance score and units in original source order.
 pub fn render_payload(units: &[CodeUnit], plan: &BudgetPlan) -> String {
     let mut plan_by_id: HashMap<usize, &PlannedUnit> = HashMap::new();
     for p in &plan.included {
         plan_by_id.insert(p.unit_id, p);
     }
 
-    let mut files: Vec<&std::path::PathBuf> = units.iter().map(|u| &u.file).collect();
-    files.sort();
-    files.dedup();
+    // Map file -> max score among its included units
+    let mut file_scores: HashMap<&std::path::PathBuf, f32> = HashMap::new();
+    for p in &plan.included {
+        if let Some(u) = units.iter().find(|u| u.id == p.unit_id) {
+            let entry = file_scores.entry(&u.file).or_insert(0.0);
+            if p.score > *entry {
+                *entry = p.score;
+            }
+        }
+    }
+
+    let mut files: Vec<&std::path::PathBuf> = file_scores.keys().copied().collect();
+    files.sort_by(|a, b| {
+        let sa = file_scores.get(a).copied().unwrap_or(0.0);
+        let sb = file_scores.get(b).copied().unwrap_or(0.0);
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
 
     let mut out = String::new();
     for file in files {
@@ -209,8 +225,34 @@ pub fn render_payload(units: &[CodeUnit], plan: &BudgetPlan) -> String {
         }
         file_units.sort_by_key(|u| u.start_line);
 
+        // Suppress child units whose parent container in the same file is already rendered in Full
+        let mut rendered_units = Vec::new();
+        for u in &file_units {
+            let is_enclosed_by_full_parent = file_units.iter().any(|parent| {
+                if parent.id == u.id {
+                    return false;
+                }
+                let is_enclosed = parent.start_line <= u.start_line && parent.end_line >= u.end_line;
+                if !is_enclosed {
+                    return false;
+                }
+                plan_by_id
+                    .get(&parent.id)
+                    .map(|p| p.inclusion == Inclusion::Full)
+                    .unwrap_or(false)
+            });
+
+            if !is_enclosed_by_full_parent {
+                rendered_units.push(*u);
+            }
+        }
+
+        if rendered_units.is_empty() {
+            continue;
+        }
+
         out.push_str(&format!("// === {} ===\n", file.display().to_string().replace('\\', "/")));
-        for u in file_units {
+        for u in rendered_units {
             let planned = plan_by_id[&u.id];
             let text = match planned.inclusion {
                 Inclusion::Full => &u.full_text,
@@ -289,5 +331,56 @@ mod tests {
 
         assert_eq!(plan1.included[0].unit_id, plan2.included[0].unit_id);
         assert_eq!(plan1.included[0].unit_id, 0); // alpha sorted first by line/file
+    }
+
+    #[test]
+    fn test_render_payload_deduplication_and_file_ordering() {
+        let class_unit = CodeUnit {
+            id: 0,
+            file: PathBuf::from("src/auth.ts"),
+            kind: UnitKind::Class,
+            name: "AuthService".to_string(),
+            doc_comment: None,
+            signature: "class AuthService".to_string(),
+            full_text: "class AuthService {\n    validate(token: string) { return true; }\n}".to_string(),
+            compact_text: "class AuthService {\n    validate(token: string) { return true; }\n}".to_string(),
+            skeleton_text: "class AuthService {\n    /* ... body elided ... */\n}".to_string(),
+            start_line: 1,
+            end_line: 10,
+            est_tokens_full: 40,
+            est_tokens_compact: 40,
+            est_tokens_skeleton: 10,
+            references: vec![],
+        };
+
+        let method_unit = CodeUnit {
+            id: 1,
+            file: PathBuf::from("src/auth.ts"),
+            kind: UnitKind::Method,
+            name: "validate".to_string(),
+            doc_comment: None,
+            signature: "validate(token: string)".to_string(),
+            full_text: "validate(token: string) { return true; }".to_string(),
+            compact_text: "validate(token: string) { return true; }".to_string(),
+            skeleton_text: "validate(token: string) { /* ... */ }".to_string(),
+            start_line: 2,
+            end_line: 4,
+            est_tokens_full: 15,
+            est_tokens_compact: 15,
+            est_tokens_skeleton: 5,
+            references: vec![],
+        };
+
+        let units = vec![class_unit, method_unit];
+        let mut scores = HashMap::new();
+        scores.insert(0, 5.0);
+        scores.insert(1, 10.0);
+
+        // When budget allows both Full, method should NOT be duplicated in payload
+        let plan = select_within_budget(&units, &scores, 100);
+        let payload = render_payload(&units, &plan);
+
+        let validate_count = payload.matches("validate(token: string)").count();
+        assert_eq!(validate_count, 1, "validate method should appear exactly once, but appeared {validate_count} times in:\n{payload}");
     }
 }

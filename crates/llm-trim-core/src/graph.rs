@@ -114,17 +114,22 @@ impl CodeGraph {
 
     /// Combine lexical BM25 relevance scores with PageRank centrality.
     ///
+    /// If weight <= 0.0, graph boost is bypassed and pure lexical scores are returned.
     /// If an intent query is active (lexical scores > 0):
-    /// `boosted = lexical * (1.0 + weight * centrality) + 0.5 * weight * centrality`
+    /// `boosted = lexical * (1.0 + weight * centrality) + (2.0 * weight * centrality)`
     ///
     /// If no intent is given (lexical scores == 0):
-    /// `boosted = centrality`
+    /// `boosted = 1.0 + weight * centrality`
     pub fn apply_centrality_boost(
         &self,
         lexical_scores: &HashMap<usize, f32>,
         units: &[CodeUnit],
         weight: f32,
     ) -> HashMap<usize, f32> {
+        if weight <= 0.0 {
+            return lexical_scores.clone();
+        }
+
         let has_lexical = lexical_scores.values().any(|&s| s > 0.0);
         let mut combined = HashMap::with_capacity(units.len());
 
@@ -133,9 +138,9 @@ impl CodeGraph {
             let cent = self.centrality.get(&u.id).copied().unwrap_or(0.0);
 
             let score = if has_lexical {
-                lex * (1.0 + weight * cent) + (0.5 * weight * cent)
+                lex * (1.0 + weight * cent) + (2.0 * weight * cent)
             } else {
-                cent
+                1.0 + weight * cent
             };
 
             combined.insert(u.id, score);

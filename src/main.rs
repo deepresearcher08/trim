@@ -53,6 +53,14 @@ struct Cli {
     #[arg(long)]
     scan_secrets: bool,
 
+    /// Disable PageRank graph centrality scoring.
+    #[arg(long)]
+    no_graph: bool,
+
+    /// PageRank centrality boost weight multiplier.
+    #[arg(long, default_value_t = 0.5)]
+    graph_weight: f32,
+
     /// Explicit path to a `trim.config.toml` or `trim.toml` file.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -187,6 +195,12 @@ fn main() -> Result<()> {
         if !cli.scan_secrets && cfg.scan_secrets.unwrap_or(false) {
             cli.scan_secrets = true;
         }
+        if !cli.no_graph && cfg.no_graph.unwrap_or(false) {
+            cli.no_graph = true;
+        }
+        if let Some(gw) = cfg.graph_weight {
+            cli.graph_weight = gw;
+        }
         if cli.cache_file.is_none() {
             if let Some(cf) = cfg.cache_file {
                 cli.cache_file = Some(PathBuf::from(cf));
@@ -211,7 +225,8 @@ fn main() -> Result<()> {
     let lexical_scores = build_scores(&cli, &units, &heuristic)?;
 
     // Fold graph centrality into final scores (boost foundational symbols)
-    let mut scores = graph.apply_centrality_boost(&lexical_scores, &units, 0.4);
+    let effective_weight = if cli.no_graph { 0.0 } else { cli.graph_weight };
+    let mut scores = graph.apply_centrality_boost(&lexical_scores, &units, effective_weight);
 
     // Initial budget selection pass
     let mut plan = select_within_budget(&units, &scores, cli.budget);
@@ -248,7 +263,18 @@ fn main() -> Result<()> {
         }
         eprintln!("--------------------------------------------------------------------------------");
 
-        for u in &units {
+        let mut sorted_units: Vec<&llm_trim_core::CodeUnit> = units.iter().collect();
+        sorted_units.sort_by(|a, b| {
+            let sa = scores.get(&a.id).copied().unwrap_or(0.0);
+            let sb = scores.get(&b.id).copied().unwrap_or(0.0);
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.start_line.cmp(&b.start_line))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        for u in sorted_units {
             let diag = diag_by_id.get(&u.id);
             let planned = plan_by_id.get(&u.id);
             let cent = graph.centrality.get(&u.id).copied().unwrap_or(0.0);

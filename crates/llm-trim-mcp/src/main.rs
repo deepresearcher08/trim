@@ -49,6 +49,14 @@ struct TrimParams {
     #[schemars(default)]
     deps: Option<bool>,
 
+    /// Disable PageRank graph centrality scoring.
+    #[schemars(default)]
+    no_graph: Option<bool>,
+
+    /// PageRank centrality boost weight multiplier (defaults to 0.5).
+    #[schemars(default)]
+    graph_weight: Option<f32>,
+
     /// When true, skip reading or writing the .trim_cache file and
     /// re-parse every source file from scratch.
     #[schemars(default)]
@@ -89,6 +97,11 @@ impl TrimServer {
         let intent = params.intent.as_deref().unwrap_or("");
         let cache_enabled = !params.no_cache.unwrap_or(false);
         let pull_deps = params.deps.unwrap_or(false);
+        let graph_weight = if params.no_graph.unwrap_or(false) {
+            0.0
+        } else {
+            params.graph_weight.unwrap_or(0.5)
+        };
 
         let units = match parse_codebase_cached(&root, None, cache_enabled) {
             Ok(u) => u,
@@ -102,7 +115,7 @@ impl TrimServer {
         let graph = CodeGraph::build(&units);
         let ranker = HeuristicRanker::new();
         let lexical_scores = ranker.score(intent, &units);
-        let mut scores = graph.apply_centrality_boost(&lexical_scores, &units, 0.4);
+        let mut scores = graph.apply_centrality_boost(&lexical_scores, &units, graph_weight);
 
         let mut plan = select_within_budget(&units, &scores, budget);
 

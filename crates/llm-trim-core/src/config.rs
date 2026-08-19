@@ -19,6 +19,10 @@ pub struct TrimConfig {
     pub deps: Option<bool>,
     /// Whether to scan and redact credentials/secrets in payloads
     pub scan_secrets: Option<bool>,
+    /// Whether to disable graph centrality (PageRank) scoring
+    pub no_graph: Option<bool>,
+    /// PageRank centrality boost weight multiplier (defaults to 0.5)
+    pub graph_weight: Option<f32>,
     /// Glob patterns to ignore in addition to .gitignore
     pub ignore: Option<Vec<String>>,
     /// Custom cache file path

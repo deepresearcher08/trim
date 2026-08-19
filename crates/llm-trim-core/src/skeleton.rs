@@ -184,72 +184,122 @@ fn python_docstring(node: Node, source: &str) -> Option<String> {
     None
 }
 
+/// Find the AST body/block node within a declaration.
+fn find_body_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    let body_fields = [
+        "body",
+        "block",
+        "compound_statement",
+        "declaration_list",
+        "interface_body",
+        "class_body",
+        "enum_body",
+    ];
+    for f in body_fields {
+        if let Some(b) = node.child_by_field_name(f) {
+            return Some(b);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let k = child.kind();
+        if k.contains("body")
+            || k.contains("block")
+            || k == "compound_statement"
+            || k == "declaration_list"
+            || k == "field_declaration_list"
+            || k == "enum_variant_list"
+            || k == "enum_member_declaration_list"
+            || k == "object_type"
+            || k == "body_statement"
+        {
+            return Some(child);
+        }
+    }
+    None
+}
+
 /// Constructs skeleton representation for a syntax node by extracting
 /// declaration signatures and inserting explicit elision markers for body
 /// blocks. Operates strictly on complete AST nodes to ensure syntactic
 /// clarity and prevent partial statement truncation.
-fn build_skeleton(lang: Language, kind: UnitKind, node: Node, source: &str) -> (String, String) {
-    let full_text = source[node.byte_range()].to_string();
+fn build_skeleton(
+    lang: Language,
+    kind: UnitKind,
+    decl_node: Node,
+    full_node: Node,
+    source: &str,
+) -> (String, String) {
+    let full_text = source[full_node.byte_range()].to_string();
 
     if !has_elidable_body(kind) {
         return (full_text.clone(), full_text);
     }
 
-    let body_field = ["body", "block", "compound_statement"];
-    let body_node = body_field
-        .iter()
-        .find_map(|f| node.child_by_field_name(f));
-
+    let body_node = find_body_node(decl_node);
     let skeleton = match body_node {
         Some(body) => {
+            let sig_start = full_node.start_byte();
             let sig_end = body.start_byte();
-            let sig = source[node.start_byte()..sig_end].trim_end().to_string();
-            match lang {
-                Language::Python => match python_docstring(node, source) {
-                    Some(doc) => format!("{sig}\n    {doc}\n    ...  # body elided by trim"),
-                    None => format!("{sig}\n    ...  # body elided by trim"),
-                },
-                Language::Ruby => {
-                    format!("{sig}\n  # ... body elided by trim ...\nend")
-                }
-                Language::Go => {
-                    format!("{sig} {{\n    // ... body elided by trim ...\n}}")
-                }
-                Language::Rust
-                | Language::JavaScript
-                | Language::TypeScript
-                | Language::Tsx
-                | Language::C
-                | Language::Cpp
-                | Language::Java
-                | Language::CSharp
-                | Language::Php => {
-                    format!("{sig} {{\n    /* ... body elided by trim ... */\n}}")
+            if sig_end <= sig_start {
+                full_text.clone()
+            } else {
+                let sig = source[sig_start..sig_end].trim_end().to_string();
+                match lang {
+                    Language::Python => match python_docstring(decl_node, source) {
+                        Some(doc) => format!("{sig}\n    {doc}\n    ...  # body elided by trim"),
+                        None => format!("{sig}\n    ...  # body elided by trim"),
+                    },
+                    Language::Ruby => {
+                        format!("{sig}\n  # ... body elided by trim ...\nend")
+                    }
+                    Language::Go => {
+                        format!("{sig} {{\n    // ... body elided by trim ...\n}}")
+                    }
+                    Language::Rust
+                    | Language::JavaScript
+                    | Language::TypeScript
+                    | Language::Tsx
+                    | Language::C
+                    | Language::Cpp
+                    | Language::Java
+                    | Language::CSharp
+                    | Language::Php => {
+                        format!("{sig} {{\n    /* ... body elided by trim ... */\n}}")
+                    }
                 }
             }
         }
         None => full_text.clone(),
     };
 
-    (full_text, skeleton)
+    let skeleton_final = if skeleton.len() >= full_text.len() {
+        full_text.clone()
+    } else {
+        skeleton
+    };
+
+    (full_text, skeleton_final)
 }
 
 /// Constructs the third tier (Compact) representation between full text
 /// and bare skeleton. Preserves signature, docstring, and initial statements/lines
 /// with an explicit compact elision notice, killing the hard degradation cliff.
-fn build_compact(lang: Language, kind: UnitKind, node: Node, source: &str) -> String {
-    let full_text = source[node.byte_range()].to_string();
+fn build_compact(
+    lang: Language,
+    kind: UnitKind,
+    decl_node: Node,
+    full_node: Node,
+    source: &str,
+) -> String {
+    let full_text = source[full_node.byte_range()].to_string();
 
     if !has_elidable_body(kind) {
         return full_text;
     }
 
-    let body_field = ["body", "block", "compound_statement"];
-    let body_node = body_field
-        .iter()
-        .find_map(|f| node.child_by_field_name(f));
-
-    let body = match body_node {
+    let body = match find_body_node(decl_node) {
         Some(b) => b,
         None => return full_text,
     };
@@ -259,14 +309,18 @@ fn build_compact(lang: Language, kind: UnitKind, node: Node, source: &str) -> St
         return full_text;
     }
 
+    let sig_start = full_node.start_byte();
     let sig_end = body.start_byte();
-    let sig = source[node.start_byte()..sig_end].trim_end().to_string();
+    if sig_end <= sig_start {
+        return full_text;
+    }
+    let sig = source[sig_start..sig_end].trim_end().to_string();
     let body_raw = &source[body.byte_range()];
     let body_lines: Vec<&str> = body_raw.lines().collect();
 
-    match lang {
+    let compact = match lang {
         Language::Python => {
-            let doc = python_docstring(node, source);
+            let doc = python_docstring(decl_node, source);
             let mut prefix_lines = Vec::new();
             if let Some(d) = &doc {
                 prefix_lines.push(format!("    {d}"));
@@ -396,6 +450,12 @@ fn build_compact(lang: Language, kind: UnitKind, node: Node, source: &str) -> St
                 format!("{sig} {{\n{}\n    /* ... remaining body elided by trim ... */\n}}", inner_lines.join("\n"))
             }
         }
+    };
+
+    if compact.len() >= full_text.len() {
+        full_text
+    } else {
+        compact
     }
 }
 
@@ -658,19 +718,23 @@ fn walk(
         } else {
             preceding_doc_comment(lang, node, source)
         };
-        let (full_text, skeleton_text) = build_skeleton(lang, kind, full_node, source);
+        let (full_text, skeleton_text) = build_skeleton(lang, kind, node, full_node, source);
         let skeleton_with_doc = match &doc {
             Some(d) if lang != Language::Python => format!("{d}\n{skeleton_text}"),
             _ => skeleton_text,
         };
 
-        let compact_text = build_compact(lang, kind, full_node, source);
+        let compact_text = build_compact(lang, kind, node, full_node, source);
         let compact_with_doc = match &doc {
             Some(d) if lang != Language::Python => format!("{d}\n{compact_text}"),
             _ => compact_text,
         };
 
         let references = extract_references(node, source, &name);
+
+        let est_full = estimate_tokens(&full_text);
+        let est_compact = estimate_tokens(&compact_with_doc).min(est_full);
+        let est_skeleton = estimate_tokens(&skeleton_with_doc).min(est_full);
 
         units.push(CodeUnit {
             id: *next_id,
@@ -679,9 +743,9 @@ fn walk(
             name,
             doc_comment: doc,
             signature: first_line(&full_text),
-            est_tokens_full: estimate_tokens(&full_text),
-            est_tokens_compact: estimate_tokens(&compact_with_doc),
-            est_tokens_skeleton: estimate_tokens(&skeleton_with_doc),
+            est_tokens_full: est_full,
+            est_tokens_compact: est_compact,
+            est_tokens_skeleton: est_skeleton,
             full_text,
             compact_text: compact_with_doc,
             skeleton_text: skeleton_with_doc,
@@ -757,5 +821,43 @@ mod tests {
         let units = extract_units(&PathBuf::from("script.js"), Language::JavaScript, raw_src, &mut id).unwrap();
         assert!(!units.is_empty(), "fallback must produce units and never drop source files");
         assert_eq!(units[0].signature, "const A = 1;");
+    }
+
+    #[test]
+    fn test_exported_typescript_functions_and_interfaces() {
+        let mut id = 0;
+        let ts_src = r#"
+/**
+ * Searches for files matching the given query filter.
+ */
+export function filter(items: string[], query: string): string[] {
+    const results = [];
+    for (const item of items) {
+        if (item.includes(query)) {
+            results.push(item);
+        }
+    }
+    return results;
+}
+
+export interface SearchOptions {
+    caseSensitive: boolean;
+    maxResults: number;
+    timeoutMs: number;
+}
+"#;
+        let units = extract_units(&PathBuf::from("filter.ts"), Language::TypeScript, ts_src, &mut id).unwrap();
+        assert_eq!(units.len(), 2);
+
+        let filter_unit = units.iter().find(|u| u.name == "filter").unwrap();
+        assert!(filter_unit.est_tokens_skeleton < filter_unit.est_tokens_full,
+            "Skeleton tokens ({}) must be strictly less than full tokens ({})",
+            filter_unit.est_tokens_skeleton, filter_unit.est_tokens_full);
+        assert!(filter_unit.skeleton_text.contains("/* ... body elided by trim ... */"));
+        assert!(filter_unit.skeleton_text.contains("export function filter"));
+
+        let iface_unit = units.iter().find(|u| u.name == "SearchOptions").unwrap();
+        assert!(iface_unit.est_tokens_skeleton <= iface_unit.est_tokens_full);
+        assert!(iface_unit.skeleton_text.contains("export interface SearchOptions"));
     }
 }

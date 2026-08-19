@@ -269,6 +269,10 @@ impl HeuristicRanker {
                 &["rank", "ranking"],
                 &["score", "relevance", "weight", "priority", "sort", "order", "heuristic", "bm25"],
             ),
+            (
+                &["dedupe", "deduplicate", "duplicate", "twice", "repeat", "idempotent", "throttle", "debounce"],
+                &["dedupe", "unique", "distinct", "filter", "throttle", "debounce", "cache", "singleton", "idempotent", "once", "replay", "request"],
+            ),
         ];
 
         for &(triggers, syns) in synonyms {
