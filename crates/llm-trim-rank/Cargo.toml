@@ -10,7 +10,7 @@ documentation = "https://github.com/deepresearcher08/trim#readme"
 
 [dependencies]
 anyhow = "1"
-llm-trim-core = { path = "../llm-trim-core", version = "0.1.1" }
+llm-trim-core = { path = "../llm-trim-core", version = "0.2.0" }
 
 ort = { version = "2.0.0-rc.4", optional = true }
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }

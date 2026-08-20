@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 authors = ["Deep <deepresearcher08>"]
@@ -32,8 +32,8 @@ name = "trim"
 path = "src/main.rs"
 
 [dependencies]
-llm-trim-core = { path = "crates/llm-trim-core", version = "0.1.1" }
-llm-trim-rank = { path = "crates/llm-trim-rank", version = "0.1.1" }
+llm-trim-core = { path = "crates/llm-trim-core", version = "0.2.0" }
+llm-trim-rank = { path = "crates/llm-trim-rank", version = "0.2.0" }
 clap = { version = "4", features = ["derive"] }
 inquire = "0.7"
 anyhow = "1"
