@@ -1,14 +1,24 @@
-//! Cross-file dependency graph and graph-centrality engine.
+//! Cross-file AST-resolved dependency graph and PageRank centrality engine.
 //!
-//! Builds a lightweight in-memory directed reference graph from AST symbol
-//! definitions and extracted references with zero external dependencies.
-//! Computes PageRank and degree centrality to boost foundational modules
-//! and provides caller/callee traversal.
+//! Resolves AST call expressions, method invocations, and type instantiations
+//! to concrete definitions across files. Computes PageRank centrality to boost
+//! foundational symbols and provides caller/callee edge attribution for `--why` and `--deps`.
 
 use crate::unit::CodeUnit;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub caller_id: usize,
+    pub callee_id: usize,
+    pub caller_file: PathBuf,
+    pub caller_line: usize,
+    pub callee_name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodeGraph {
     /// unit_id -> list of unit_ids that this unit depends on (callees / types used)
     pub dependencies: HashMap<usize, Vec<usize>>,
@@ -16,43 +26,123 @@ pub struct CodeGraph {
     pub dependents: HashMap<usize, Vec<usize>>,
     /// unit_id -> PageRank centrality score in [0.0, 1.0]
     pub centrality: HashMap<usize, f32>,
+    /// All resolved call graph edges
+    pub edges: Vec<GraphEdge>,
+    /// unit_id -> incoming edges (callers calling this unit)
+    pub incoming_edges: HashMap<usize, Vec<GraphEdge>>,
+    /// unit_id -> outgoing edges (calls made by this unit)
+    pub outgoing_edges: HashMap<usize, Vec<GraphEdge>>,
 }
 
 impl CodeGraph {
-    /// Build a dependency graph across all extracted code units.
+    /// Build a true call graph across all extracted code units.
     pub fn build(units: &[CodeUnit]) -> Self {
-        // Map symbol name -> unit IDs that define it
-        let mut name_to_ids: HashMap<&str, Vec<usize>> = HashMap::new();
+        // Map symbol name -> candidate unit definitions
+        let mut name_to_units: HashMap<&str, Vec<&CodeUnit>> = HashMap::new();
         for u in units {
             if !u.name.is_empty() && u.name != "<anonymous>" {
-                name_to_ids.entry(&u.name).or_default().push(u.id);
+                name_to_units.entry(&u.name).or_default().push(u);
             }
         }
 
         let mut dependencies: HashMap<usize, Vec<usize>> = HashMap::with_capacity(units.len());
         let mut dependents: HashMap<usize, Vec<usize>> = HashMap::with_capacity(units.len());
+        let mut incoming_edges: HashMap<usize, Vec<GraphEdge>> = HashMap::with_capacity(units.len());
+        let mut outgoing_edges: HashMap<usize, Vec<GraphEdge>> = HashMap::with_capacity(units.len());
+        let mut all_edges = Vec::new();
 
         for u in units {
             dependencies.entry(u.id).or_default();
             dependents.entry(u.id).or_default();
+            incoming_edges.entry(u.id).or_default();
+            outgoing_edges.entry(u.id).or_default();
         }
 
-        for u in units {
-            let mut target_ids = HashSet::new();
-            for ref_name in &u.references {
-                if let Some(target_list) = name_to_ids.get(ref_name.as_str()) {
-                    for &target_id in target_list {
-                        if target_id != u.id {
-                            target_ids.insert(target_id);
+        for caller in units {
+            let mut resolved_callees = HashSet::new();
+
+            // 1. Process structured AST call sites if available
+            if !caller.call_sites.is_empty() {
+                for call in &caller.call_sites {
+                    if let Some(candidates) = name_to_units.get(call.callee_name.as_str()) {
+                        let mut matched_target: Option<&CodeUnit> = None;
+
+                        if let Some(qualifier) = &call.module_qualifier {
+                            for cand in candidates {
+                                let cand_file_stem = cand.file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                                if cand_file_stem.eq_ignore_ascii_case(qualifier) {
+                                    matched_target = Some(cand);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if matched_target.is_none() {
+                            for cand in candidates {
+                                if cand.file == caller.file && cand.id != caller.id {
+                                    matched_target = Some(cand);
+                                    break;
+                                }
+                            }
+                        }
+
+                        let target_units: Vec<&CodeUnit> = if let Some(target) = matched_target {
+                            vec![target]
+                        } else {
+                            candidates.iter().copied().filter(|c| c.id != caller.id).collect()
+                        };
+
+                        for target in target_units {
+                            if target.id != caller.id && resolved_callees.insert((target.id, call.line)) {
+                                let edge = GraphEdge {
+                                    caller_id: caller.id,
+                                    callee_id: target.id,
+                                    caller_file: caller.file.clone(),
+                                    caller_line: call.line,
+                                    callee_name: call.callee_name.clone(),
+                                };
+                                dependencies.entry(caller.id).or_default().push(target.id);
+                                dependents.entry(target.id).or_default().push(caller.id);
+                                outgoing_edges.entry(caller.id).or_default().push(edge.clone());
+                                incoming_edges.entry(target.id).or_default().push(edge.clone());
+                                all_edges.push(edge);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fallback for units without AST call_sites (e.g. synthetic or test units)
+                for ref_name in &caller.references {
+                    if let Some(candidates) = name_to_units.get(ref_name.as_str()) {
+                        for target in candidates {
+                            if target.id != caller.id && resolved_callees.insert((target.id, caller.start_line)) {
+                                let edge = GraphEdge {
+                                    caller_id: caller.id,
+                                    callee_id: target.id,
+                                    caller_file: caller.file.clone(),
+                                    caller_line: caller.start_line,
+                                    callee_name: ref_name.clone(),
+                                };
+                                dependencies.entry(caller.id).or_default().push(target.id);
+                                dependents.entry(target.id).or_default().push(caller.id);
+                                outgoing_edges.entry(caller.id).or_default().push(edge.clone());
+                                incoming_edges.entry(target.id).or_default().push(edge.clone());
+                                all_edges.push(edge);
+                            }
                         }
                     }
                 }
             }
+        }
 
-            for target_id in target_ids {
-                dependencies.entry(u.id).or_default().push(target_id);
-                dependents.entry(target_id).or_default().push(u.id);
-            }
+        // Deduplicate neighbor lists
+        for list in dependencies.values_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
+        for list in dependents.values_mut() {
+            list.sort_unstable();
+            list.dedup();
         }
 
         let centrality = Self::compute_pagerank(units, &dependents, &dependencies);
@@ -61,6 +151,9 @@ impl CodeGraph {
             dependencies,
             dependents,
             centrality,
+            edges: all_edges,
+            incoming_edges,
+            outgoing_edges,
         }
     }
 
@@ -112,14 +205,7 @@ impl CodeGraph {
             .collect()
     }
 
-    /// Combine lexical BM25 relevance scores with PageRank centrality.
-    ///
-    /// If weight <= 0.0, graph boost is bypassed and pure lexical scores are returned.
-    /// If an intent query is active (lexical scores > 0):
-    /// `boosted = lexical * (1.0 + weight * centrality) + (2.0 * weight * centrality)`
-    ///
-    /// If no intent is given (lexical scores == 0):
-    /// `boosted = 1.0 + weight * centrality`
+    /// Combine lexical BM25 relevance scores with PageRank centrality with sanity capping.
     pub fn apply_centrality_boost(
         &self,
         lexical_scores: &HashMap<usize, f32>,
@@ -137,10 +223,13 @@ impl CodeGraph {
             let lex = lexical_scores.get(&u.id).copied().unwrap_or(0.0);
             let cent = self.centrality.get(&u.id).copied().unwrap_or(0.0);
 
+            // Centered, transparent centrality scoring with saturating cap
+            let cent_boost = (weight * cent * 2.0).min(4.0);
+
             let score = if has_lexical {
-                lex * (1.0 + weight * cent) + (2.0 * weight * cent)
+                lex + cent_boost
             } else {
-                1.0 + weight * cent
+                1.0 + cent_boost
             };
 
             combined.insert(u.id, score);
@@ -165,6 +254,22 @@ impl CodeGraph {
             .unwrap_or(&[])
     }
 
+    /// Retrieve incoming call graph edges for a given callee unit ID.
+    pub fn get_incoming_edges(&self, unit_id: usize) -> &[GraphEdge] {
+        self.incoming_edges
+            .get(&unit_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Retrieve outgoing call graph edges for a given caller unit ID.
+    pub fn get_outgoing_edges(&self, unit_id: usize) -> &[GraphEdge] {
+        self.outgoing_edges
+            .get(&unit_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Given unit IDs selected for Full inclusion, find all direct dependencies (callees)
     /// that should be pulled into context to avoid orphaned fragments.
     pub fn pull_direct_dependencies(&self, full_unit_ids: &[usize]) -> HashSet<usize> {
@@ -183,13 +288,23 @@ impl CodeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unit::UnitKind;
+    use crate::unit::{CallSite, UnitKind};
     use std::path::PathBuf;
 
-    fn make_unit_with_refs(id: usize, name: &str, refs: Vec<&str>) -> CodeUnit {
+    fn make_unit_with_calls(id: usize, name: &str, file: &str, calls: Vec<(&str, usize)>) -> CodeUnit {
+        let call_sites: Vec<CallSite> = calls
+            .into_iter()
+            .map(|(callee, line)| CallSite {
+                callee_name: callee.to_string(),
+                module_qualifier: None,
+                line,
+            })
+            .collect();
+        let refs: Vec<String> = call_sites.iter().map(|c| c.callee_name.clone()).collect();
+
         CodeUnit {
             id,
-            file: PathBuf::from(format!("src/{name}.rs")),
+            file: PathBuf::from(file),
             kind: UnitKind::Function,
             name: name.to_string(),
             doc_comment: None,
@@ -198,28 +313,31 @@ mod tests {
             compact_text: format!("fn {name}() {{}}"),
             skeleton_text: format!("fn {name}() {{}}"),
             start_line: 1,
-            end_line: 5,
+            end_line: 10,
             est_tokens_full: 20,
             est_tokens_compact: 15,
             est_tokens_skeleton: 5,
-            references: refs.into_iter().map(|s| s.to_string()).collect(),
+            references: refs,
+            call_sites,
         }
     }
 
     #[test]
-    fn test_code_graph_centrality() {
-        // u0 (core_util) is referenced by u1, u2, u3
-        let u0 = make_unit_with_refs(0, "core_util", vec![]);
-        let u1 = make_unit_with_refs(1, "service_a", vec!["core_util"]);
-        let u2 = make_unit_with_refs(2, "service_b", vec!["core_util"]);
-        let u3 = make_unit_with_refs(3, "service_c", vec!["core_util"]);
-        let units = vec![u0, u1, u2, u3];
+    fn test_code_graph_true_edges() {
+        let u0 = make_unit_with_calls(0, "core_util", "src/util.rs", vec![]);
+        let u1 = make_unit_with_calls(1, "service_a", "src/service_a.rs", vec![("core_util", 42)]);
+        let u2 = make_unit_with_calls(2, "service_b", "src/service_b.rs", vec![("core_util", 15)]);
+        let units = vec![u0, u1, u2];
 
         let graph = CodeGraph::build(&units);
-        assert_eq!(graph.get_dependents(0).len(), 3);
+        assert_eq!(graph.get_dependents(0).len(), 2);
         assert_eq!(graph.get_dependencies(1), &[0]);
 
-        // core_util has the highest centrality
+        let incoming_to_0 = graph.get_incoming_edges(0);
+        assert_eq!(incoming_to_0.len(), 2);
+        assert_eq!(incoming_to_0[0].caller_line, 42);
+        assert_eq!(incoming_to_0[0].callee_name, "core_util");
+
         let c0 = graph.centrality.get(&0).copied().unwrap_or(0.0);
         let c1 = graph.centrality.get(&1).copied().unwrap_or(0.0);
         assert!(c0 > c1, "core_util centrality ({c0}) should exceed service_a ({c1})");

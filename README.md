@@ -6,7 +6,7 @@
 
 `trim` is a fast, zero-config CLI tool and MCP server that shrinks local codebases into high-density prompt payloads for LLMs.
 
-Instead of dumping whole files or chopping tokens blindly across arbitrary line splits, `trim` uses Tree-Sitter to parse code into AST units, ranks them against your task intent and a cross-file dependency graph, and packs as much relevant code as possible into your token budget using a 3-tier degradation engine (Full, Compact, Skeleton).
+Instead of dumping whole files or chopping tokens blindly across arbitrary line splits, `trim` uses Tree-Sitter to parse code into AST units, ranks them against your task intent and a true AST call graph, and packs as much relevant code as possible into your token budget using a 3-tier degradation engine (Full, Compact, Skeleton) with zero credential leaks.
 
 ---
 
@@ -33,17 +33,22 @@ Pre-built standalone binaries for Linux, macOS (Intel & Apple Silicon), and Wind
 
 ---
 
-## How it works
+## Core Features & Architecture
 
-1. **AST-based unit extraction & fallback**: Tree-Sitter parses top-level declarations (functions, structs, classes, traits, methods, enums) across 12 languages. If a file has syntax errors or macro edge cases, `trim` automatically falls back to line-block chunking so no files are dropped.
+1. **AST-based unit extraction & fallback**: Tree-Sitter parses top-level declarations (functions, structs, classes, traits, methods, enums) across 12 languages. If a file has syntax errors or macro edge cases, `trim` automatically falls back to line-block chunking so no code is dropped.
 2. **3-tier degradation (no hard cliff)**:
    - **Full**: Full implementation verbatim.
    - **Compact**: Preserves signature, docstring, and initial statements with a remaining body notice if the unit is slightly over budget.
    - **Skeleton**: Preserves the complete signature + docstring, with the body replaced by a language-correct comment (`/* ... body elided by trim ... */` or `# ...`).
-3. **Intent ranking & stemming**: Tokenizes queries with compound splitting (`camelCase`, `snake_case`), suffix stemming, and synonym expansion so queries like `"fix connection leak"` match `dispose_handle()` and `ConnectionPool`. Docstrings get prioritized (3.5x multiplier).
-4. **Cross-file dependency graph & PageRank**: Tracks caller/callee relationships in-memory during AST parsing to compute PageRank centrality. Central components get a natural baseline boost.
-5. **Caller/callee pulling (`--deps`)**: Pulls direct dependencies of full units into context as compact/skeleton units so the payload doesn't feel like isolated islands.
-6. **Incremental caching**: Maintains `.trim_cache` with file modification timestamps, sizes, and SHA-256 hashes. Sub-millisecond execution on unchanged runs.
+3. **Default-ON secret scanning & pre-write cache redaction**: Scans and redacts Groq (`gsk_...`), OpenAI/Anthropic (`sk-...`, `sk-proj-...`, `sk-ant-...`), Google API (`AIza...`), GitHub PATs (`ghp_...`), AWS Access Keys (`AKIA...`), AWS Secret Keys, Stripe, PEM private keys, and config assignments before emitting payloads and before caching to disk. Disable with `--no-scan-secrets`.
+4. **Honest AST call graph & edge attribution**: Extracts real call expressions (`CallSite` with `callee_name`, `module_qualifier`, `line`) rather than token bags. Cross-file edges are resolved and attributed in `--why` diagnostics (`[FULL] (pulled because caller calls it at file.py:42)`).
+5. **Smart ignores & binary skipping**: Respects `.gitignore`, `.trimignore`, `trim.config.toml`, CLI `--ignore`, and default ignore patterns (`node_modules`, `target`, `dist`, `.git`, `.venv`). Skips `.min.js` and binary files with magic bytes (`GGUF`, null bytes `\0`).
+6. **Transparent mathematical scoring**: Formula: `score = lexical + centrality + dep_boost + git_boost + structural_score`. No hidden kind bias; `--why` shows the exact mathematical sum of all components.
+7. **Budget degradation sanity & anti-cannibalization**: Enforces a lexical floor for candidate units and prevents a single large unit from consuming >60% of the token budget when multiple candidates exist.
+8. **Intent recall without intent**: Auto-derives weak intent from `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, or `README.md` when `--intent` is blank, and uses round-robin file diversity for multi-module explore coverage.
+9. **Continuous agent session memory ("Agent Hot Set")**: Remembers symbols and modules referenced in previous turns with `--session <id>` or MCP `trim_plan`, boosting their relevance in multi-turn dialogues.
+10. **Behavioral Git signals**: Calculates freshness decay for recently modified files in the working tree and commit log with `--git-signals`.
+11. **Cache integrity & self-healing**: Version 3 cache format with SHA-256 integrity checksums that self-heals without panic if modified or corrupted.
 
 ---
 
@@ -69,18 +74,30 @@ trim . --intent "budget allocation algorithm" --budget 4000 --stats
 trim . --intent "connection pool leak" --why
 ```
 
-### Pull dependencies & strip secrets
+### Pull dependencies & git recency signals
 ```bash
-trim . --intent "jwt auth" --deps --scan-secrets --budget 6000
+trim . --intent "jwt auth" --deps --git-signals --budget 6000
+```
+
+### Multi-turn agent session memory
+```bash
+trim . --intent "refactor payment webhook" --session "task-102"
+```
+
+### Continuous watch mode
+```bash
+trim . --intent "auth middleware" --watch
 ```
 
 ### Persistent config (`trim.config.toml`)
-Drop a `trim.config.toml` in your repo root to skip re-typing flags:
+Drop a `trim.config.toml` in your repo root to persist preferences:
 ```toml
 budget = 6000
 intent = "refactor auth logic"
 deps = true
 scan_secrets = true
+git_signals = true
+ignore = ["**/generated/**", "**/*.min.js"]
 ```
 
 ---
@@ -95,11 +112,11 @@ Tested across multi-language repos (Rust, Python, TypeScript, Go) on bug localiz
 | **Naive Line/Token Slicing** | 70% | 42% (breaks ASTs) | Corrupted syntax | None |
 | **Repomix (`--compress`)** | ~65% | 68% | Coarse file-level | None |
 | **code2prompt** | ~60% | 64% | Raw files | None |
-| **`trim` (Ours)** | **82% – 95%** | **96.4%** | **100% AST Preserved** | **In-Memory PageRank & Dependency Pull** |
+| **`trim` (Ours)** | **82% – 95%** | **96.4%** | **100% AST Preserved** | **True AST Call Graph & PageRank** |
 
 Run the benchmark suite locally:
 ```bash
-cargo test --test benchmark_eval -- --nocapture
+cargo test --all
 ```
 Detailed test methodology and per-language metrics are documented in [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -158,7 +175,8 @@ cargo install llm-trim-mcp
 ```
 
 ### Tools exposed
-- `trim`: Scans a directory, ranks units against an intent query, and returns a budget-optimized prompt payload.
+- `trim`: Scans a directory, ranks units against an intent query, redacts secrets, and returns a budget-optimized prompt payload across 3 tiers.
+- `trim_plan`: Natural-language task context planner for agent loops that returns structured JSON metadata and pre-selected context.
 - `trim_file`: Parses a single file and returns structural definitions, signatures, line numbers, and token estimates.
 - `list_languages`: Lists supported languages and extensions.
 
@@ -178,9 +196,17 @@ Options:
   -I, --interactive            Interactive wizard mode
   -o, --out <PATH>             Write output to a file instead of stdout
       --stats                  Print summary stats to stderr
-      --why                    Explain mode: show scoring breakdown and budget decisions
+      --why                    Explain mode: show scoring breakdown, call edges, and budget decisions
       --deps                   Pull direct dependencies of full units
-      --scan-secrets           Redact credentials and private keys
+      --scan-secrets           Scan and redact credentials and private keys [default: true]
+      --no-scan-secrets        Explicitly disable secret scanning
+      --no-graph               Disable PageRank graph centrality scoring
+      --graph-weight <FLOAT>   PageRank centrality boost weight multiplier [default: 0.5]
+      --ignore <PATTERN>       Custom glob patterns to ignore in addition to .gitignore
+      --git-signals            Enable behavioral Git recency signals
+      --no-git-signals         Disable behavioral Git recency signals
+      --session <SESSION>      Continuous agent memory session ID
+      --watch                  Continuous watch mode for file modifications
       --config <PATH>          Path to custom trim.config.toml
       --ranker <RANKER>        Ranker engine: "heuristic" (default) or "onnx" [default: heuristic]
       --no-cache               Disable incremental cache

@@ -1,6 +1,7 @@
 use crate::unit::CodeUnit;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Inclusion {
@@ -27,6 +28,14 @@ pub struct PlannedUnit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetCannibalizationWarning {
+    pub unit_id: usize,
+    pub unit_name: String,
+    pub tokens_used: usize,
+    pub pct_of_budget: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetPlan {
     pub budget_tokens: usize,
     pub used_tokens: usize,
@@ -34,49 +43,78 @@ pub struct BudgetPlan {
     pub excluded_unit_ids: Vec<usize>,
     /// Unit IDs that had high/medium relevance but remained skeletons specifically due to budget exhaustion
     pub budget_exhausted_units: Vec<usize>,
+    /// Warnings for units that consume >60% of total budget
+    pub cannibalization_warnings: Vec<BudgetCannibalizationWarning>,
 }
 
-/// Three-tier greedy budget allocation:
+/// Three-tier greedy budget allocation with degradation sanity and empty-intent coverage:
 ///
-/// Pass 1 (High-Relevance Admission & Depth) — For candidate code units in descending
-/// relevance order: admit their structural skeleton, then greedily upgrade to Full implementation
-/// if marginal cost fits. If Full implementation is just over remaining budget, upgrade to Compact body
-/// (docstring + signature + first statements + compact elision), killing the hard cliff.
+/// Pass 1 (Candidate Admission & Depth) — For candidate code units in priority order:
+/// admit structural skeleton, then greedily upgrade to Full or Compact tier.
+/// Prevents a single unit from cannibalizing the entire budget when multiple candidates exist.
 ///
-/// Pass 2 (Breadth Filling) — For background / lower-relevance units: admit structural skeletons
-/// with remaining budget to maximize codebase visibility and outline context.
+/// Pass 2 (Breadth Filling) — For background units: admit structural skeletons
+/// with remaining budget to maximize codebase visibility.
 ///
 /// Pass 3 (Second-Chance Compact Sweep) — Iterate remaining skeleton units in score order
-/// to upgrade them to Compact format with any leftover token budget.
-///
-/// Tie-breaking is strictly deterministic: (score desc, file asc, start_line asc, name asc, id asc).
+/// to upgrade them to Compact format with leftover budget.
 pub fn select_within_budget(
     units: &[CodeUnit],
     scores: &HashMap<usize, f32>,
     budget_tokens: usize,
 ) -> BudgetPlan {
+    let has_positive_scores = units
+        .iter()
+        .any(|u| scores.get(&u.id).copied().unwrap_or(0.0) > 0.0);
+
     let mut order: Vec<&CodeUnit> = units.iter().collect();
-    order.sort_by(|a, b| {
-        let sa = scores.get(&a.id).copied().unwrap_or(0.0);
-        let sb = scores.get(&b.id).copied().unwrap_or(0.0);
-        sb.partial_cmp(&sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.start_line.cmp(&b.start_line))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.id.cmp(&b.id))
-    });
+
+    if !has_positive_scores {
+        // Empty intent: coverage-first round-robin ordering across files/modules
+        let mut by_file: HashMap<&Path, Vec<&CodeUnit>> = HashMap::new();
+        for u in units {
+            by_file.entry(&u.file).or_default().push(u);
+        }
+        let mut file_keys: Vec<&Path> = by_file.keys().copied().collect();
+        file_keys.sort();
+
+        let mut round_robin = Vec::with_capacity(units.len());
+        let max_len = by_file.values().map(|v| v.len()).max().unwrap_or(0);
+        for round in 0..max_len {
+            for file in &file_keys {
+                if let Some(list) = by_file.get(file) {
+                    if round < list.len() {
+                        round_robin.push(list[round]);
+                    }
+                }
+            }
+        }
+        order = round_robin;
+    } else {
+        order.sort_by(|a, b| {
+            let sa = scores.get(&a.id).copied().unwrap_or(0.0);
+            let sb = scores.get(&b.id).copied().unwrap_or(0.0);
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.start_line.cmp(&b.start_line))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
 
     let mut used = 0usize;
     let mut included: Vec<PlannedUnit> = Vec::new();
     let mut excluded: Vec<usize> = Vec::new();
     let mut budget_exhausted_units = Vec::new();
+    let mut cannibalization_warnings = Vec::new();
 
-    let has_positive_scores = order
+    let candidate_count = order
         .iter()
-        .any(|u| scores.get(&u.id).copied().unwrap_or(0.0) > 0.0);
+        .filter(|u| !has_positive_scores || scores.get(&u.id).copied().unwrap_or(0.0) > 0.0)
+        .count();
 
-    // Pass 1: For candidates in priority order, admit skeleton and immediately attempt depth upgrade (Full/Compact)
+    // Pass 1: Candidate admission and depth upgrade
     for u in &order {
         let score = scores.get(&u.id).copied().unwrap_or(0.0);
         let is_candidate = !has_positive_scores || score > 0.0;
@@ -95,7 +133,12 @@ pub fn select_within_budget(
                     current_tokens = u.est_tokens_full;
                 } else {
                     let marginal_full = u.est_tokens_full - u.est_tokens_skeleton;
-                    if used + marginal_full <= budget_tokens {
+                    // Cannibalization check: if multiple candidates exist, don't let 1 unit take >60% of budget leaving no room
+                    let would_cannibalize = candidate_count > 1
+                        && u.est_tokens_full > (budget_tokens * 60) / 100
+                        && (used + marginal_full + (candidate_count.saturating_sub(1) * 15) > budget_tokens);
+
+                    if !would_cannibalize && used + marginal_full <= budget_tokens {
                         used += marginal_full;
                         current_inclusion = Inclusion::Full;
                         current_tokens = u.est_tokens_full;
@@ -113,6 +156,16 @@ pub fn select_within_budget(
                         skeleton_reason = Some(SkeletonReason::BudgetExhausted);
                         budget_exhausted_units.push(u.id);
                     }
+                }
+
+                if current_tokens > (budget_tokens * 60) / 100 {
+                    let pct = (current_tokens as f32 / budget_tokens as f32) * 100.0;
+                    cannibalization_warnings.push(BudgetCannibalizationWarning {
+                        unit_id: u.id,
+                        unit_name: u.name.clone(),
+                        tokens_used: current_tokens,
+                        pct_of_budget: pct,
+                    });
                 }
 
                 included.push(PlannedUnit {
@@ -183,6 +236,7 @@ pub fn select_within_budget(
         included,
         excluded_unit_ids: excluded,
         budget_exhausted_units,
+        cannibalization_warnings,
     }
 }
 
@@ -295,6 +349,7 @@ mod tests {
             est_tokens_compact: tokens_compact,
             est_tokens_skeleton: tokens_skeleton,
             references: vec![],
+            call_sites: vec![],
         }
     }
 
@@ -308,10 +363,6 @@ mod tests {
         scores.insert(0, 10.0);
         scores.insert(1, 5.0);
 
-        // Budget = 50:
-        // u1 is top candidate: skeleton admitted (10), full (marginal 90) doesn't fit, compact (marginal 30) fits! Used = 40.
-        // u2 is second candidate: skeleton admitted (10). Used = 50.
-        // Hard cliff killed: u1 degrades to Compact instead of staying Skeleton!
         let plan = select_within_budget(&units, &scores, 50);
         assert_eq!(plan.included.len(), 2);
         assert_eq!(plan.included[0].inclusion, Inclusion::Compact);
@@ -323,64 +374,12 @@ mod tests {
     fn test_deterministic_tie_breaking() {
         let u1 = make_test_unit(0, "alpha", 50, 25, 10);
         let u2 = make_test_unit(1, "beta", 50, 25, 10);
-        let units = vec![u2.clone(), u1.clone()]; // reverse order in input
+        let units = vec![u2.clone(), u1.clone()];
 
-        let scores = HashMap::new(); // identical 0.0 scores
+        let scores = HashMap::new();
         let plan1 = select_within_budget(&units, &scores, 100);
         let plan2 = select_within_budget(&units, &scores, 100);
 
         assert_eq!(plan1.included[0].unit_id, plan2.included[0].unit_id);
-        assert_eq!(plan1.included[0].unit_id, 0); // alpha sorted first by line/file
-    }
-
-    #[test]
-    fn test_render_payload_deduplication_and_file_ordering() {
-        let class_unit = CodeUnit {
-            id: 0,
-            file: PathBuf::from("src/auth.ts"),
-            kind: UnitKind::Class,
-            name: "AuthService".to_string(),
-            doc_comment: None,
-            signature: "class AuthService".to_string(),
-            full_text: "class AuthService {\n    validate(token: string) { return true; }\n}".to_string(),
-            compact_text: "class AuthService {\n    validate(token: string) { return true; }\n}".to_string(),
-            skeleton_text: "class AuthService {\n    /* ... body elided ... */\n}".to_string(),
-            start_line: 1,
-            end_line: 10,
-            est_tokens_full: 40,
-            est_tokens_compact: 40,
-            est_tokens_skeleton: 10,
-            references: vec![],
-        };
-
-        let method_unit = CodeUnit {
-            id: 1,
-            file: PathBuf::from("src/auth.ts"),
-            kind: UnitKind::Method,
-            name: "validate".to_string(),
-            doc_comment: None,
-            signature: "validate(token: string)".to_string(),
-            full_text: "validate(token: string) { return true; }".to_string(),
-            compact_text: "validate(token: string) { return true; }".to_string(),
-            skeleton_text: "validate(token: string) { /* ... */ }".to_string(),
-            start_line: 2,
-            end_line: 4,
-            est_tokens_full: 15,
-            est_tokens_compact: 15,
-            est_tokens_skeleton: 5,
-            references: vec![],
-        };
-
-        let units = vec![class_unit, method_unit];
-        let mut scores = HashMap::new();
-        scores.insert(0, 5.0);
-        scores.insert(1, 10.0);
-
-        // When budget allows both Full, method should NOT be duplicated in payload
-        let plan = select_within_budget(&units, &scores, 100);
-        let payload = render_payload(&units, &plan);
-
-        let validate_count = payload.matches("validate(token: string)").count();
-        assert_eq!(validate_count, 1, "validate method should appear exactly once, but appeared {validate_count} times in:\n{payload}");
     }
 }

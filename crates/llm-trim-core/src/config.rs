@@ -17,16 +17,20 @@ pub struct TrimConfig {
     pub ranker: Option<String>,
     /// Whether to automatically pull in direct caller/callee dependencies
     pub deps: Option<bool>,
-    /// Whether to scan and redact credentials/secrets in payloads
+    /// Whether to scan and redact credentials/secrets in payloads (defaults to true)
     pub scan_secrets: Option<bool>,
     /// Whether to disable graph centrality (PageRank) scoring
     pub no_graph: Option<bool>,
     /// PageRank centrality boost weight multiplier (defaults to 0.5)
     pub graph_weight: Option<f32>,
-    /// Glob patterns to ignore in addition to .gitignore
+    /// Glob patterns to ignore in addition to .gitignore and defaults
     pub ignore: Option<Vec<String>>,
     /// Custom cache file path
     pub cache_file: Option<String>,
+    /// Whether to apply Git recency behavioral signals
+    pub git_signals: Option<bool>,
+    /// Continuous agent memory session ID
+    pub session_id: Option<String>,
 }
 
 impl TrimConfig {
@@ -74,6 +78,7 @@ intent = "refactor auth logic"
 ranker = "heuristic"
 deps = true
 scan_secrets = true
+git_signals = true
 ignore = ["**/generated/**", "**/*.min.js"]
 "#;
         let cfg: TrimConfig = toml::from_str(toml_str)?;
@@ -81,6 +86,7 @@ ignore = ["**/generated/**", "**/*.min.js"]
         assert_eq!(cfg.intent.as_deref(), Some("refactor auth logic"));
         assert_eq!(cfg.deps, Some(true));
         assert_eq!(cfg.scan_secrets, Some(true));
+        assert_eq!(cfg.git_signals, Some(true));
         assert_eq!(cfg.ignore.as_ref().map(|v| v.len()), Some(2));
         Ok(())
     }

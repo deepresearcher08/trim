@@ -8,22 +8,33 @@
 //! Opt-in `onnx` feature: `OnnxCrossEncoderRanker`, using ONNX Runtime
 //! (`ort`) bindings for neural cross-encoder re-ranking. See `MODELS.md`.
 
+pub mod git;
+
 use llm_trim_core::CodeUnit;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 #[cfg(feature = "onnx")]
 pub mod onnx;
+
+pub use git::GitSignals;
 
 /// Detailed score diagnostics for explain mode (`--why`).
 #[derive(Debug, Clone, Default)]
 pub struct ScoreDiagnostic {
     pub unit_id: usize,
     pub total_score: f32,
+    pub lexical_score: f32,
+    pub centrality_score: f32,
+    pub dep_boost: f32,
+    pub git_boost: f32,
+    pub structural_score: f32,
     pub name_score: f32,
     pub doc_score: f32,
     pub sig_score: f32,
     pub body_score: f32,
     pub matched_terms: Vec<String>,
+    pub why_explanation: Option<String>,
 }
 
 /// Common interface for relevance scoring implementations.
@@ -31,6 +42,93 @@ pub trait Ranker {
     /// Score extracted code units against a query intent string. Higher scores
     /// indicate greater relevance. Returned map is keyed by `CodeUnit::id`.
     fn score(&self, intent: &str, units: &[CodeUnit]) -> HashMap<usize, f32>;
+}
+
+/// Derive a weak intent string from repository context (manifests, README).
+pub fn derive_weak_intent(root: &Path) -> Option<String> {
+    // 1. Cargo.toml
+    let cargo_path = root.join("Cargo.toml");
+    if cargo_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&cargo_path) {
+            let mut name = None;
+            let mut desc = None;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("name =") && name.is_none() {
+                    name = trimmed.split('=').nth(1).map(|s| s.trim().trim_matches('"').to_string());
+                } else if trimmed.starts_with("description =") && desc.is_none() {
+                    desc = trimmed.split('=').nth(1).map(|s| s.trim().trim_matches('"').to_string());
+                }
+            }
+            if let Some(n) = name {
+                return Some(format!("{} {}", n, desc.unwrap_or_default()).trim().to_string());
+            }
+        }
+    }
+
+    // 2. package.json
+    let pkg_path = root.join("package.json");
+    if pkg_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+            let mut name = None;
+            let mut desc = None;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("\"name\":") && name.is_none() {
+                    name = trimmed.split(':').nth(1).map(|s| s.trim().trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                } else if trimmed.starts_with("\"description\":") && desc.is_none() {
+                    desc = trimmed.split(':').nth(1).map(|s| s.trim().trim_matches(|c| c == '"' || c == ',' || c == ' ').to_string());
+                }
+            }
+            if let Some(n) = name {
+                return Some(format!("{} {}", n, desc.unwrap_or_default()).trim().to_string());
+            }
+        }
+    }
+
+    // 3. pyproject.toml
+    let pyproj_path = root.join("pyproject.toml");
+    if pyproj_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pyproj_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("name =") {
+                    if let Some(n) = trimmed.split('=').nth(1).map(|s| s.trim().trim_matches('"').to_string()) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. go.mod
+    let gomod_path = root.join("go.mod");
+    if gomod_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&gomod_path) {
+            if let Some(first) = content.lines().next() {
+                if first.starts_with("module ") {
+                    return Some(first["module ".len()..].trim().to_string());
+                }
+            }
+        }
+    }
+
+    // 5. README.md
+    for name in &["README.md", "readme.md", "README"] {
+        let readme_path = root.join(name);
+        if readme_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&readme_path) {
+                for line in content.lines() {
+                    let trimmed = line.trim().trim_start_matches('#').trim();
+                    if !trimmed.is_empty() && trimmed.len() <= 120 {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    root.file_name().and_then(|n| n.to_str()).map(|s| s.to_string())
 }
 
 /// Advanced dependency-free lexical ranker featuring compound splitting,
@@ -304,11 +402,17 @@ impl HeuristicRanker {
                 .map(|u| ScoreDiagnostic {
                     unit_id: u.id,
                     total_score: 0.0,
+                    lexical_score: 0.0,
+                    centrality_score: 0.0,
+                    dep_boost: 0.0,
+                    git_boost: 0.0,
+                    structural_score: 0.0,
                     name_score: 0.0,
                     doc_score: 0.0,
                     sig_score: 0.0,
                     body_score: 0.0,
                     matched_terms: vec![],
+                    why_explanation: None,
                 })
                 .collect();
         }
@@ -356,19 +460,25 @@ impl HeuristicRanker {
             }
 
             let len_penalty = 1.0 + (sig_terms.len() as f32 / 50.0);
-            let total = (name_score + doc_score + sig_score + body_score) / len_penalty;
+            let lexical_total = (name_score + doc_score + sig_score + body_score) / len_penalty;
 
             let mut matched_list: Vec<String> = matched_terms.into_iter().collect();
             matched_list.sort();
 
             diagnostics.push(ScoreDiagnostic {
                 unit_id: u.id,
-                total_score: total,
+                total_score: lexical_total,
+                lexical_score: lexical_total,
+                centrality_score: 0.0,
+                dep_boost: 0.0,
+                git_boost: 0.0,
+                structural_score: 0.0,
                 name_score,
                 doc_score,
                 sig_score,
                 body_score,
                 matched_terms: matched_list,
+                why_explanation: None,
             });
         }
 
@@ -421,6 +531,7 @@ mod tests {
             est_tokens_compact: 20,
             est_tokens_skeleton: 10,
             references: vec![],
+            call_sites: vec![],
         }
     }
 
@@ -504,7 +615,6 @@ mod tests {
             "pub fn authenticate_user_session(req: Request) {}",
         );
 
-        // Plural / misspelled / synonym query: "users authentications logining"
         let scores = ranker.score("users authentications logining", &[u1]);
         assert!(scores.get(&1).copied().unwrap_or(0.0) > 0.0);
     }

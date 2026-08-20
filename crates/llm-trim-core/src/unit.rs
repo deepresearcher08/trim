@@ -32,6 +32,17 @@ impl UnitKind {
     }
 }
 
+/// A specific call expression or type invocation occurrence in the AST.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallSite {
+    /// Name of the function, method, or type being called / instantiated.
+    pub callee_name: String,
+    /// Qualifying module, receiver object, or namespace if present (e.g. "pool" in "pool.acquire()").
+    pub module_qualifier: Option<String>,
+    /// 1-indexed source line number where the call expression appears.
+    pub line: usize,
+}
+
 /// A single top-level (or method-level) definition extracted from a source
 /// file, carried through Tier 2 (ranking) and Tier 3 (budget selection).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +76,9 @@ pub struct CodeUnit {
     /// extracted from the body for cross-file dependency graph analysis.
     #[serde(default)]
     pub references: Vec<String>,
+    /// AST-resolved call sites with line numbers and module qualifiers.
+    #[serde(default)]
+    pub call_sites: Vec<CallSite>,
 }
 
 pub fn estimate_tokens(s: &str) -> usize {

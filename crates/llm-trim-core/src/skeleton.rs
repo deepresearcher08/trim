@@ -1,5 +1,5 @@
 use crate::lang::Language;
-use crate::unit::{estimate_tokens, CodeUnit, UnitKind};
+use crate::unit::{estimate_tokens, CallSite, CodeUnit, UnitKind};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
@@ -459,29 +459,196 @@ fn build_compact(
     }
 }
 
-/// Extract referenced identifier/type names from inside a node subtree.
-fn extract_references(node: Node, source: &str, unit_name: &str) -> Vec<String> {
-    let mut refs = HashSet::new();
+/// Extract call sites (function calls, method invocations, constructor/struct instantiations)
+/// directly from the Tree-Sitter AST with accurate line numbers and module qualifiers.
+fn extract_call_sites(
+    node: Node,
+    source: &str,
+    unit_name: &str,
+    _lang: Language,
+) -> (Vec<CallSite>, Vec<String>) {
+    let mut call_sites = Vec::new();
+    let mut unique_refs = HashSet::new();
 
-    fn recurse(node: Node, source: &str, unit_name: &str, refs: &mut HashSet<String>) {
+    fn is_ignored_name(s: &str) -> bool {
+        s.len() < 2
+            || !is_not_common_keyword(s)
+            || matches!(
+                s,
+                "println"
+                    | "print"
+                    | "format"
+                    | "panic"
+                    | "assert"
+                    | "assert_eq"
+                    | "assert_ne"
+                    | "console"
+                    | "log"
+                    | "info"
+                    | "warn"
+                    | "error"
+                    | "debug"
+                    | "trace"
+                    | "len"
+                    | "count"
+                    | "is_empty"
+                    | "is_none"
+                    | "is_some"
+                    | "is_ok"
+                    | "is_err"
+                    | "clone"
+                    | "to_string"
+                    | "as_str"
+                    | "to_owned"
+                    | "into"
+                    | "from"
+                    | "unwrap"
+                    | "expect"
+                    | "push"
+                    | "pop"
+                    | "insert"
+                    | "remove"
+                    | "contains"
+                    | "get"
+                    | "map"
+                    | "iter"
+                    | "collect"
+                    | "and_then"
+                    | "or_else"
+                    | "trim"
+                    | "split"
+                    | "lines"
+                    | "replace"
+                    | "substring"
+                    | "slice"
+                    | "join"
+                    | "find"
+                    | "starts_with"
+                    | "ends_with"
+                    | "equals"
+                    | "toString"
+                    | "valueOf"
+                    | "hasOwnProperty"
+                    | "append"
+                    | "make"
+                    | "new"
+            )
+    }
+
+    fn recurse(
+        node: Node,
+        source: &str,
+        unit_name: &str,
+        sites: &mut Vec<CallSite>,
+        refs: &mut HashSet<String>,
+    ) {
         let kind = node.kind();
-        if kind.contains("identifier") || kind == "type_identifier" || kind == "field_identifier" || kind == "property_identifier" {
-            let text = &source[node.byte_range()];
-            if text.len() >= 2 && text != unit_name && is_not_common_keyword(text) {
-                refs.insert(text.to_string());
+        let line = node.start_position().row + 1;
+
+        if kind == "call_expression"
+            || kind == "call"
+            || kind == "method_invocation"
+            || kind == "invocation_expression"
+        {
+            let fn_node = node
+                .child_by_field_name("function")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| node.child_by_field_name("callee"))
+                .or_else(|| node.child_by_field_name("expression"))
+                .or_else(|| node.child(0));
+
+            if let Some(target) = fn_node {
+                let target_kind = target.kind();
+                if target_kind.contains("identifier") {
+                    let name = &source[target.byte_range()];
+                    if !is_ignored_name(name) && name != unit_name {
+                        sites.push(CallSite {
+                            callee_name: name.to_string(),
+                            module_qualifier: None,
+                            line,
+                        });
+                        refs.insert(name.to_string());
+                    }
+                } else if target_kind == "scoped_identifier" || target_kind == "qualified_identifier" {
+                    let name_node = target.child_by_field_name("name").or_else(|| target.child(2));
+                    let path_node = target.child_by_field_name("path").or_else(|| target.child(0));
+                    if let Some(nn) = name_node {
+                        let name = &source[nn.byte_range()];
+                        let qualifier = path_node.map(|pn| source[pn.byte_range()].to_string());
+                        if !is_ignored_name(name) && name != unit_name {
+                            sites.push(CallSite {
+                                callee_name: name.to_string(),
+                                module_qualifier: qualifier,
+                                line,
+                            });
+                            refs.insert(name.to_string());
+                        }
+                    }
+                } else if target_kind == "field_expression"
+                    || target_kind == "member_expression"
+                    || target_kind == "attribute"
+                    || target_kind == "selector_expression"
+                {
+                    let field_node = target
+                        .child_by_field_name("field")
+                        .or_else(|| target.child_by_field_name("property"))
+                        .or_else(|| target.child_by_field_name("attribute"))
+                        .or_else(|| target.child(target.child_count().saturating_sub(1)));
+                    let obj_node = target
+                        .child_by_field_name("argument")
+                        .or_else(|| target.child_by_field_name("object"))
+                        .or_else(|| target.child_by_field_name("value"))
+                        .or_else(|| target.child_by_field_name("operand"))
+                        .or_else(|| target.child(0));
+
+                    if let Some(fn_node) = field_node {
+                        let name = &source[fn_node.byte_range()];
+                        let qualifier = obj_node.map(|on| source[on.byte_range()].to_string());
+                        if !is_ignored_name(name) && name != unit_name {
+                            sites.push(CallSite {
+                                callee_name: name.to_string(),
+                                module_qualifier: qualifier,
+                                line,
+                            });
+                            refs.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        } else if kind == "struct_expression"
+            || kind == "new_expression"
+            || kind == "composite_literal"
+            || kind == "object_creation_expression"
+        {
+            let type_node = node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("constructor"))
+                .or_else(|| node.child_by_field_name("type"))
+                .or_else(|| node.child(0));
+
+            if let Some(tn) = type_node {
+                let name = &source[tn.byte_range()];
+                if !is_ignored_name(name) && name != unit_name {
+                    sites.push(CallSite {
+                        callee_name: name.to_string(),
+                        module_qualifier: None,
+                        line,
+                    });
+                    refs.insert(name.to_string());
+                }
             }
         }
 
-        let mut c = node.walk();
-        for child in node.children(&mut c) {
-            recurse(child, source, unit_name, refs);
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            recurse(child, source, unit_name, sites, refs);
         }
     }
 
-    recurse(node, source, unit_name, &mut refs);
-    let mut list: Vec<String> = refs.into_iter().collect();
-    list.sort();
-    list
+    recurse(node, source, unit_name, &mut call_sites, &mut unique_refs);
+    let mut ref_list: Vec<String> = unique_refs.into_iter().collect();
+    ref_list.sort();
+    (call_sites, ref_list)
 }
 
 fn is_not_common_keyword(s: &str) -> bool {
@@ -684,6 +851,7 @@ pub fn fallback_extract_units(
             start_line,
             end_line,
             references: vec![],
+            call_sites: vec![],
         });
         *next_id += 1;
     }
@@ -730,7 +898,7 @@ fn walk(
             _ => compact_text,
         };
 
-        let references = extract_references(node, source, &name);
+        let (call_sites, references) = extract_call_sites(node, source, &name, lang);
 
         let est_full = estimate_tokens(&full_text);
         let est_compact = estimate_tokens(&compact_with_doc).min(est_full);
@@ -752,6 +920,7 @@ fn walk(
             start_line: full_node.start_position().row + 1,
             end_line: full_node.end_position().row + 1,
             references,
+            call_sites,
         });
         *next_id += 1;
     }
