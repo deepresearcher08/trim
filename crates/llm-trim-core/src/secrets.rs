@@ -49,8 +49,12 @@ fn get_secret_patterns() -> &'static [(&'static str, Regex)] {
                 Regex::new(r"[sr]k_(?:live|test)_[0-9a-zA-Z]{24,}").unwrap(),
             ),
             (
-                "Private Key Header",
-                Regex::new(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----").unwrap(),
+                "Private Key",
+                Regex::new(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]*?-{4,5}END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----").unwrap(),
+            ),
+            (
+                "Private Key",
+                Regex::new(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----.*").unwrap(),
             ),
             (
                 "Slack Token",
@@ -182,6 +186,36 @@ let moniker = "keyboard_value_name";
         assert!(clean.contains("let apiKeyFromName = true;"), "Innocent identifier must not be redacted");
         assert!(clean.contains("let apiKeyFromName = \"innocent_var_name\";"), "Identifier containing 'key' but not used as a key must not be redacted");
         assert!(clean.contains("let moniker = \"keyboard_value_name\";"), "Innocent identifier containing 'key' must not be redacted");
+    }
+
+    #[test]
+    fn test_pem_private_key_full_block_redaction() {
+        // Multi-line PEM block with END marker must be fully redacted
+        let multi_line = r#"const KEY = "-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEA0examplebody
+abc123def456ghi789
+-----END RSA PRIVATE KEY-----";
+"#;
+        let (clean, detections) = scan_and_redact(multi_line);
+        assert!(!clean.contains("MIIEowIBAAKCAQEA0examplebody"));
+        assert!(!clean.contains("abc123def456ghi789"));
+        assert!(!clean.contains("BEGIN RSA PRIVATE KEY"));
+        assert!(!clean.contains("END RSA PRIVATE KEY"));
+        assert!(clean.contains("[REDACTED: Private Key]"));
+        assert!(detections.iter().any(|d| d.kind == "Private Key"));
+
+        // Single-line PEM with body and END marker on same line
+        let single_line = r#"const K = "-----BEGIN OPENSSH PRIVATE KEY-----MIIEowIBAAKCAQEA0----END OPENSSH PRIVATE KEY-----";"#;
+        let (clean2, _) = scan_and_redact(single_line);
+        assert!(!clean2.contains("MIIEowIBAAKCAQEA0"));
+        assert!(!clean2.contains("BEGIN OPENSSH PRIVATE KEY"));
+
+        // Truncated header (no END marker) - header + rest of line must not leak
+        let truncated = r#"const PEM = "-----BEGIN EC PRIVATE KEY-----MIIEowIBAAKCAQEA0...";"#;
+        let (clean3, detections3) = scan_and_redact(truncated);
+        assert!(!clean3.contains("MIIEowIBAAKCAQEA0"));
+        assert!(!clean3.contains("BEGIN EC PRIVATE KEY"));
+        assert!(detections3.iter().any(|d| d.kind == "Private Key"));
     }
 
     #[test]

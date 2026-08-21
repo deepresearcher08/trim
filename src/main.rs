@@ -2,12 +2,13 @@ use anyhow::Result;
 use clap::Parser;
 use llm_trim_core::{
     cache::parse_codebase_cached_with_options, format_scan_report, render_payload,
-    scan_and_redact, select_within_budget, CodeGraph, Inclusion, SessionStore,
+    scan_and_redact, select_within_budget, CodeGraph, CodeUnit, Inclusion, SessionStore,
     SkeletonReason, TrimConfig,
 };
 use llm_trim_rank::{derive_weak_intent, GitSignals, HeuristicRanker, Ranker, ScoreDiagnostic};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -115,6 +116,222 @@ struct Cli {
     /// Path to the cache file. Defaults to `.trim_cache` inside the scanned root directory.
     #[arg(long)]
     cache_file: Option<PathBuf>,
+
+    /// Create a .trim_index.json file on disk with all units (metadata + text).
+    /// Subsequent --grep and --extract calls read from this index.
+    #[arg(long)]
+    index: bool,
+
+    /// Search the index file for a pattern (case-insensitive substring match on name, signature, file, kind).
+    /// Returns matching units with snippets. Requires --index to have been run first.
+    #[arg(long)]
+    grep: Option<String>,
+
+    /// Extract a specific unit from the index by name (exact match).
+    /// Returns the full text of the unit. Requires --index to have been run first.
+    #[arg(long)]
+    extract: Option<String>,
+}
+
+/// Index file structure for --index, --grep, --extract workflow.
+#[derive(Debug, Serialize, Deserialize)]
+struct TrimIndex {
+    version: u32,
+    root: PathBuf,
+    created: String,
+    units: Vec<IndexUnit>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexUnit {
+    id: usize,
+    file: PathBuf,
+    kind: String,
+    name: String,
+    signature: String,
+    doc_comment: Option<String>,
+    start_line: usize,
+    end_line: usize,
+    tokens_full: usize,
+    tokens_compact: usize,
+    tokens_skeleton: usize,
+    references: Vec<String>,
+    full_text: String,
+    compact_text: String,
+    skeleton_text: String,
+}
+
+impl From<&CodeUnit> for IndexUnit {
+    fn from(u: &CodeUnit) -> Self {
+        Self {
+            id: u.id,
+            file: u.file.clone(),
+            kind: u.kind.as_str().to_string(),
+            name: u.name.clone(),
+            signature: u.signature.clone(),
+            doc_comment: u.doc_comment.clone(),
+            start_line: u.start_line,
+            end_line: u.end_line,
+            tokens_full: u.est_tokens_full,
+            tokens_compact: u.est_tokens_compact,
+            tokens_skeleton: u.est_tokens_skeleton,
+            references: u.references.clone(),
+            full_text: u.full_text.clone(),
+            compact_text: u.compact_text.clone(),
+            skeleton_text: u.skeleton_text.clone(),
+        }
+    }
+}
+
+const INDEX_VERSION: u32 = 1;
+const INDEX_FILE_NAME: &str = ".trim_index.json";
+
+fn index_path_for(root: &Path) -> PathBuf {
+    root.join(INDEX_FILE_NAME)
+}
+
+fn create_index(root: &Path, units: &[CodeUnit]) -> Result<PathBuf> {
+    let index = TrimIndex {
+        version: INDEX_VERSION,
+        root: root.to_path_buf(),
+        created: chrono_now(),
+        units: units.iter().map(IndexUnit::from).collect(),
+    };
+    let path = index_path_for(root);
+    let json = serde_json::to_string_pretty(&index)?;
+    std::fs::write(&path, json)?;
+    eprintln!("trim: index created at {} ({} units)", path.display(), index.units.len());
+    Ok(path)
+}
+
+fn load_index(root: &Path) -> Result<TrimIndex> {
+    let path = index_path_for(root);
+    if !path.exists() {
+        anyhow::bail!(
+            "index not found at {}. Run `trim --index {}` first.",
+            path.display(),
+            root.display()
+        );
+    }
+    let json = std::fs::read_to_string(&path)?;
+    let index: TrimIndex = serde_json::from_str(&json)?;
+    if index.version != INDEX_VERSION {
+        anyhow::bail!(
+            "index version mismatch: expected {}, got {}. Re-run --index.",
+            INDEX_VERSION,
+            index.version
+        );
+    }
+    Ok(index)
+}
+
+fn grep_index(root: &Path, pattern: &str) -> Result<()> {
+    let index = load_index(root)?;
+    let pat = pattern.to_lowercase();
+    let mut matches: Vec<&IndexUnit> = index
+        .units
+        .iter()
+        .filter(|u| {
+            u.name.to_lowercase().contains(&pat)
+                || u.signature.to_lowercase().contains(&pat)
+                || u.kind.to_lowercase().contains(&pat)
+                || u.file.display().to_string().to_lowercase().contains(&pat)
+                || u.doc_comment
+                    .as_ref()
+                    .map(|d| d.to_lowercase().contains(&pat))
+                    .unwrap_or(false)
+                || u.references.iter().any(|r| r.to_lowercase().contains(&pat))
+        })
+        .collect();
+
+    matches.sort_by(|a, b| b.tokens_full.cmp(&a.tokens_full));
+
+    if matches.is_empty() {
+        eprintln!("trim grep: no matches for '{pattern}' in index ({} units)", index.units.len());
+        return Ok(());
+    }
+
+    eprintln!(
+        "trim grep: {} matches for '{}' (showing snippets)\n",
+        matches.len(),
+        pattern
+    );
+
+    for u in &matches {
+        let file_display = u.file.display().to_string().replace('\\', "/");
+        // Show compact text as snippet (truncated to first 5 lines)
+        let snippet: String = u
+            .compact_text
+            .lines()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("--- {} ({}:{})", u.name, file_display, u.start_line);
+        println!("    kind: {}, tokens: {}", u.kind, u.tokens_full);
+        println!("{snippet}");
+        println!();
+    }
+
+    eprintln!(
+        "trim grep: {} matches found. Use --extract <name> to get full text.",
+        matches.len()
+    );
+    Ok(())
+}
+
+fn extract_from_index(root: &Path, unit_name: &str) -> Result<()> {
+    let index = load_index(root)?;
+    let matches: Vec<&IndexUnit> = index
+        .units
+        .iter()
+        .filter(|u| u.name == unit_name)
+        .collect();
+
+    if matches.is_empty() {
+        anyhow::bail!(
+            "no unit named '{}' in index. Use --grep to search.",
+            unit_name
+        );
+    }
+
+    if matches.len() > 1 {
+        eprintln!(
+            "trim extract: {} units named '{}'. Showing all:\n",
+            matches.len(),
+            unit_name
+        );
+        for u in &matches {
+            let file_display = u.file.display().to_string().replace('\\', "/");
+            println!("// === {}:{}-{} ===", file_display, u.start_line, u.end_line);
+            println!("// kind: {}, tokens: {}", u.kind, u.tokens_full);
+            if let Some(ref doc) = u.doc_comment {
+                println!("// doc: {doc}");
+            }
+            println!("{}\n", u.full_text);
+        }
+        return Ok(());
+    }
+
+    let u = matches[0];
+    let file_display = u.file.display().to_string().replace('\\', "/");
+    println!("// === {}:{}-{} ===", file_display, u.start_line, u.end_line);
+    println!("// kind: {}, tokens_full: {}, compact: {}, skeleton: {}", u.kind, u.tokens_full, u.tokens_compact, u.tokens_skeleton);
+    if let Some(ref doc) = u.doc_comment {
+        println!("// doc: {doc}");
+    }
+    println!();
+    println!("{}", u.full_text);
+
+    Ok(())
+}
+
+fn chrono_now() -> String {
+    // Simple timestamp without adding chrono dependency
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{now}")
 }
 
 fn run_interactive_wizard(mut cli: Cli) -> Result<Cli> {
@@ -566,6 +783,16 @@ fn main() -> Result<()> {
     env_logger::init();
     let mut cli = Cli::parse();
 
+    // Handle --grep and --extract before pipeline (read from existing index)
+    if let Some(ref pattern) = cli.grep {
+        let root = cli.path.canonicalize().unwrap_or_else(|_| cli.path.clone());
+        return grep_index(&root, pattern);
+    }
+    if let Some(ref name) = cli.extract {
+        let root = cli.path.canonicalize().unwrap_or_else(|_| cli.path.clone());
+        return extract_from_index(&root, name);
+    }
+
     if cli.interactive {
         cli = run_interactive_wizard(cli)?;
     }
@@ -580,6 +807,22 @@ fn main() -> Result<()> {
         }
     } else {
         execute_trim_pipeline(&cli)?;
+    }
+
+    // Handle --index: create index file after pipeline runs
+    if cli.index {
+        let root = cli.path.canonicalize().unwrap_or_else(|_| cli.path.clone());
+        let cache_enabled = !cli.no_cache;
+        let cache_path = cli.cache_file.as_deref();
+        let custom_ignores = cli.ignore.clone();
+        let (units, _) = parse_codebase_cached_with_options(
+            &cli.path,
+            cache_path,
+            cache_enabled,
+            &custom_ignores,
+            true,
+        )?;
+        create_index(&root, &units)?;
     }
 
     Ok(())
